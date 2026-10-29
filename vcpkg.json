@@ -1,0 +1,9 @@
+{
+  "name": "exrview",
+  "version-string": "1.0.0",
+  "description": "Trình xem OpenEXR với OpenColorIO + thumbnail/preview cho Windows Explorer",
+  "dependencies": [
+    "openexr",
+    "opencolorio"
+  ]
+}
