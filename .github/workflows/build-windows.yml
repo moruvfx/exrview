@@ -7,6 +7,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write   # để tạo Release khi push tag v*
+
 jobs:
   build:
     runs-on: windows-2022
