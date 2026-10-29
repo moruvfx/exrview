@@ -6,9 +6,14 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tạo Release với tag này (vd v1.0.0). Bỏ trống = chỉ build.'
+        required: false
+        default: ''
 
 permissions:
-  contents: write   # để tạo Release khi push tag v*
+  contents: write   # để tạo Release
 
 jobs:
   build:
@@ -71,9 +76,16 @@ jobs:
             ExrView-portable.zip
 
       - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.release_tag != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.release_tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          name: ExrView ${{ github.event.inputs.release_tag || github.ref_name }}
+          body: |
+            **Cài đặt:** tải `ExrView-Setup-*.exe`, chạy và đồng ý quyền Admin. Sau khi cài, mở thư mục có file .exr, chọn View → Large icons để thấy thumbnail, Alt+P để bật Preview pane.
+
+            **Không muốn cài:** tải `ExrView-portable.zip`, giải nén và chạy `ExrView.exe`. Muốn có thumbnail/preview trong Explorer thì chạy `regsvr32 ExrViewShell.dll` trong PowerShell Admin.
           files: |
             installer/Output/*.exe
             ExrView-portable.zip
