@@ -676,39 +676,52 @@ bool ExrFile::readLayer(int part, int layerIdx, Image& out, std::string* err, co
             std::vector<float> small;
             bool done = false;
 
-            // Tiled có mipmap/ripmap: đọc level nhỏ nhất vẫn ≥ kích thước cần.
-            if (!useLuma && P.type == "tiledimage") {
-                Imf::TiledInputPart tp(*d->file, part);
-                int lx = 0, ly = 0;
-                if (tp.levelMode() == Imf::MIPMAP_LEVELS) {
-                    for (int l = tp.numLevels() - 1; l > 0; --l)
-                        if (tp.levelWidth(l) >= tw && tp.levelHeight(l) >= th) { lx = ly = l; break; }
-                } else if (tp.levelMode() == Imf::RIPMAP_LEVELS) {
-                    for (int l = tp.numXLevels() - 1; l > 0; --l)
-                        if (tp.levelWidth(l) >= tw) { lx = l; break; }
-                    for (int l = tp.numYLevels() - 1; l > 0; --l)
-                        if (tp.levelHeight(l) >= th) { ly = l; break; }
-                }
-                if (lx > 0 || ly > 0) {
-                    Imath::Box2i lb = tp.dataWindowForLevel(lx, ly);
+            // File tiled: chỉ dùng TiledInputPart (đọc tiled qua InputPart theo dải bị OpenEXR từ chối
+            // — "Bad any_cast"). Có mipmap/ripmap thì đọc level nhỏ nhất vẫn ≥ kích thước cần;
+            // đọc theo từng hàng tile (~256 dòng) rồi cộng dồn, không giữ cả level trong RAM.
+            const bool tiled = !useLuma && h.hasTileDescription();
+            if (tiled) {
+                try {
+                    Imf::TiledInputPart tp(*d->file, part);
+                    int lx = 0, ly = 0;
+                    if (tp.levelMode() == Imf::MIPMAP_LEVELS) {
+                        for (int l = tp.numLevels() - 1; l > 0; --l)
+                            if (tp.levelWidth(l) >= tw && tp.levelHeight(l) >= th) { lx = ly = l; break; }
+                    } else if (tp.levelMode() == Imf::RIPMAP_LEVELS) {
+                        for (int l = tp.numXLevels() - 1; l > 0; --l)
+                            if (tp.levelWidth(l) >= tw) { lx = l; break; }
+                        for (int l = tp.numYLevels() - 1; l > 0; --l)
+                            if (tp.levelHeight(l) >= th) { ly = l; break; }
+                    }
+                    const Imath::Box2i lb = tp.dataWindowForLevel(lx, ly);
                     const int lw = lb.max.x - lb.min.x + 1, lh = lb.max.y - lb.min.y + 1;
-                    std::vector<float> buf((size_t)lw * lh * 4, 0.f);
-                    Imf::FrameBuffer fb;
-                    addSlices(fb, Imf::FLOAT, reinterpret_cast<char*>(buf.data()), sizeof(float), lb.min.x, lb.min.y,
-                              lb.max.x, lb.max.y);
-                    tp.setFrameBuffer(fb);
-                    try {
-                        tp.readTiles(0, tp.numXTiles(lx) - 1, 0, tp.numYTiles(ly) - 1, lx, ly);
-                    } catch (const std::exception& e) { keepWarn(e); }
-                    normalize<F32>(buf.data(), (size_t)lw * lh, nColor, ch, hasAlpha);
+                    const int tileH = std::max(1, (int)tp.tileYSize());
+                    const int nTx = tp.numXTiles(lx), nTy = tp.numYTiles(ly);
+                    const int tilesPerStrip = std::max(1, 256 / tileH);
+                    std::vector<float> buf((size_t)lw * std::min(lh, tilesPerStrip * tileH) * 4);
                     BoxAccum acc(lw, lh, tw, th);
-                    for (int y = 0; y < lh; ++y) acc.addRow<F32>(y, &buf[(size_t)y * lw * 4]);
+                    for (int ty = 0; ty < nTy; ty += tilesPerStrip) {
+                        const int ty2 = std::min(nTy - 1, ty + tilesPerStrip - 1);
+                        const int y0 = lb.min.y + ty * tileH;
+                        const int y1 = std::min(lb.max.y, lb.min.y + (ty2 + 1) * tileH - 1);
+                        const int rows = y1 - y0 + 1;
+                        std::fill(buf.begin(), buf.begin() + (size_t)lw * rows * 4, 0.f);
+                        Imf::FrameBuffer fb;
+                        addSlices(fb, Imf::FLOAT, reinterpret_cast<char*>(buf.data()), sizeof(float), lb.min.x, y0,
+                                  lb.max.x, y1);
+                        tp.setFrameBuffer(fb);
+                        try { tp.readTiles(0, nTx - 1, ty, ty2, lx, ly); } catch (const std::exception& e) { keepWarn(e); }
+                        normalize<F32>(buf.data(), (size_t)lw * rows, nColor, ch, hasAlpha);
+                        for (int r = 0; r < rows; ++r) acc.addRow<F32>(y0 - lb.min.y + r, &buf[(size_t)r * lw * 4]);
+                    }
                     acc.finish(small);
                     done = true;
+                } catch (const std::exception& e) {
+                    (void)e; // header tiled nhưng không mở được kiểu tiled -> thử đọc nguyên ảnh bên dưới
                 }
             }
 
-            if (!done && useLuma) {
+            if (!done && (useLuma || tiled)) {
                 std::vector<float> buf;
                 readFull(F32(), buf);
                 BoxAccum acc(dw, dh, tw, th);
