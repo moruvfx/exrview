@@ -488,10 +488,8 @@ void MainWindow::buildMenus()
                "C R G B A L  kênh RGB / R / G / B / Alpha / Luminance\n"
                "[ ]  exposure ∓½ stop · 0  reset exposure/gamma\n"
                "← →  frame trước/sau · Space  play/pause · Home/End  frame đầu/cuối\n"
-               "I  bảng thông tin file · F5  đọc lại file · O  hiện vùng overscan
-"
-               "V  so sánh 2 khung A | B (mỗi khung chọn pass/color space riêng) · Shift+V  chia ngang/dọc
-"
+               "I  bảng thông tin file · F5  đọc lại file · O  hiện vùng overscan\n"
+               "V  so sánh 2 khung A | B (mỗi khung chọn pass/color space riêng) · Shift+V  chia ngang/dọc\n"
                "W  wipe A/B (kéo đường chia, double-click về giữa) · D  hiệu |A − B| (exposure A = khuếch đại)"));
     });
     help->addAction(tr("Giới thiệu"), this, [this] {
