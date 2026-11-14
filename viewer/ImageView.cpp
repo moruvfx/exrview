@@ -9,7 +9,9 @@
 #include <QWheelEvent>
 #include <QtMath>
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace {
 const char* kVertex = R"(#version 330 core
@@ -17,11 +19,20 @@ layout(location = 0) in vec2 corner;
 uniform vec2 viewSize;
 uniform vec2 origin;
 uniform vec2 drawSize;
+uniform int flipH;
+uniform int flipV;
+uniform int rot90;
 out vec2 uv;
 void main() {
     vec2 px = origin + corner * drawSize;
     gl_Position = vec4(px.x / viewSize.x * 2.0 - 1.0, 1.0 - px.y / viewSize.y * 2.0, 0.0, 1.0);
-    uv = corner;
+    vec2 t = corner;
+    if (flipH != 0) t.x = 1.0 - t.x;
+    if (flipV != 0) t.y = 1.0 - t.y;
+    if (rot90 == 1) t = vec2(t.y, 1.0 - t.x);
+    else if (rot90 == 2) t = vec2(1.0 - t.x, 1.0 - t.y);
+    else if (rot90 == 3) t = vec2(1.0 - t.y, t.x);
+    uv = t;
 }
 )";
 
@@ -31,17 +42,64 @@ out vec4 fragColor;
 uniform sampler2D exrv_image;
 uniform int exrv_channel;
 uniform float exrv_invGamma;
+uniform int exrv_bgMode;
+uniform int exrv_inspectMode;
+uniform float exrv_exposure;
 )";
 
 const char* kFragmentMain = R"(
+vec3 exrv_falseColor(float lum) {
+    // Bản đồ False Color theo stops quanh 18% gray (0.18)
+    float stops = log2(max(lum, 1e-6) / 0.18);
+    // -6 -> tím, -4 -> xanh dương, -2 -> cyan, 0 -> xanh lá, +1 -> hồng, +2.5 -> vàng, +4 -> đỏ
+    vec3 c;
+    if (stops < -4.0) {
+        c = mix(vec3(0.18, 0.0, 0.35), vec3(0.0, 0.15, 0.85), clamp((stops + 6.0) / 2.0, 0.0, 1.0));
+    } else if (stops < -2.0) {
+        c = mix(vec3(0.0, 0.15, 0.85), vec3(0.0, 0.75, 0.85), (stops + 4.0) / 2.0);
+    } else if (stops < -0.3) {
+        c = mix(vec3(0.0, 0.75, 0.85), vec3(0.15, 0.75, 0.2), (stops + 2.0) / 1.7);
+    } else if (stops < 0.3) {
+        c = vec3(0.15, 0.8, 0.25); // 18% gray zone
+    } else if (stops < 1.3) {
+        c = mix(vec3(0.45, 0.75, 0.2), vec3(0.95, 0.55, 0.65), (stops - 0.3) / 1.0);
+    } else if (stops < 2.8) {
+        c = mix(vec3(0.95, 0.55, 0.65), vec3(0.98, 0.9, 0.15), (stops - 1.3) / 1.5);
+    } else {
+        c = mix(vec3(0.98, 0.9, 0.15), vec3(1.0, 0.1, 0.05), clamp((stops - 2.8) / 1.5, 0.0, 1.0));
+    }
+    return c;
+}
+
 void main() {
-    vec4 c = texture(exrv_image, uv);
+    vec4 raw = texture(exrv_image, uv);
+    bool badNan = any(isnan(raw.rgb)) || any(isinf(raw.rgb));
+    if (exrv_inspectMode == 2) {
+        if (badNan) { fragColor = vec4(1.0, 0.0, 1.0, 1.0); return; }
+        if (any(lessThan(raw.rgb, vec3(0.0)))) { fragColor = vec4(0.0, 0.95, 1.0, 1.0); return; }
+        vec3 scaled = raw.rgb * exp2(exrv_exposure);
+        if (any(greaterThan(scaled, vec3(1.0)))) {
+            float stripe = mod(floor((gl_FragCoord.x + gl_FragCoord.y) * 0.25), 2.0);
+            fragColor = mix(vec4(1.0, 0.18, 0.05, 1.0), vec4(1.0, 0.85, 0.1, 1.0), stripe);
+            return;
+        }
+    }
+
+    vec4 c = raw;
     if (any(isnan(c))) c = vec4(0.0);
     if (exrv_channel == 4) {
         float a = clamp(c.a, 0.0, 1.0);
         fragColor = vec4(a, a, a, 1.0);
         return;
     }
+
+    if (exrv_inspectMode == 1) {
+        if (badNan) { fragColor = vec4(1.0, 0.0, 1.0, 1.0); return; }
+        float lum = dot(max(c.rgb * exp2(exrv_exposure), vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+        fragColor = vec4(exrv_falseColor(lum), 1.0);
+        return;
+    }
+
     if (exrv_channel == 1) c.rgb = vec3(c.r);
     else if (exrv_channel == 2) c.rgb = vec3(c.g);
     else if (exrv_channel == 3) c.rgb = vec3(c.b);
@@ -49,7 +107,14 @@ void main() {
     c = OCIODisplay(c);
     vec3 o = clamp(c.rgb, 0.0, 1.0);
     if (any(isnan(o))) o = vec3(0.0);
-    fragColor = vec4(pow(o, vec3(exrv_invGamma)), 1.0);
+    o = pow(o, vec3(exrv_invGamma));
+    if (exrv_inspectMode == 2) o *= 0.45;
+    if (exrv_bgMode == 3) {
+        ivec2 cell = ivec2(floor(gl_FragCoord.xy / 12.0));
+        vec3 chk = ((cell.x + cell.y) & 1) == 0 ? vec3(0.18) : vec3(0.27);
+        o = mix(chk, o, clamp(raw.a, 0.0, 1.0));
+    }
+    fragColor = vec4(o, 1.0);
 }
 )";
 
@@ -92,6 +157,15 @@ float channelValue(const float* d, exrv::ChannelMode ch)
     default: return 0.f;
     }
 }
+
+QColor bgClearColor(ImageView::BgMode m)
+{
+    switch (m) {
+    case ImageView::BgMode::Black: return QColor(0, 0, 0);
+    case ImageView::BgMode::Gray: return QColor(72, 72, 74);
+    default: return QColor(34, 34, 37);
+    }
+}
 } // namespace
 
 ImageView::ImageView(exrv::ColorPipeline* pipeline, QWidget* parent) : QOpenGLWidget(parent)
@@ -119,7 +193,8 @@ ImageView::~ImageView()
 QSize ImageView::imageSize() const
 {
     const auto& s = m_layers[0].src;
-    return s ? QSize(s->width, s->height) : QSize();
+    if (!s) return QSize();
+    return (m_rot90 & 1) ? QSize(s->height, s->width) : QSize(s->width, s->height);
 }
 
 void ImageView::setSource(std::shared_ptr<const exrv::Image> img, bool keepView)
@@ -211,6 +286,53 @@ void ImageView::secondColorConfigChanged()
     update();
 }
 
+void ImageView::setBgMode(BgMode m)
+{
+    if (m_bgMode == m) return;
+    m_bgMode = m;
+    update();
+}
+
+void ImageView::setInspectMode(InspectMode m)
+{
+    if (m_inspectMode == m) return;
+    m_inspectMode = m;
+    m_layers[0].cpuDirty = true;
+    m_layers[1].cpuDirty = true;
+    update();
+}
+
+void ImageView::setPixelGrid(bool on)
+{
+    if (m_pixelGrid == on) return;
+    m_pixelGrid = on;
+    update();
+}
+
+void ImageView::setFlipH(bool on)
+{
+    if (m_flipH == on) return;
+    m_flipH = on;
+    update();
+}
+
+void ImageView::setFlipV(bool on)
+{
+    if (m_flipV == on) return;
+    m_flipV = on;
+    update();
+}
+
+void ImageView::setRot90(int steps)
+{
+    steps = ((steps % 4) + 4) % 4;
+    if (m_rot90 == steps) return;
+    bool oddChanged = (m_rot90 & 1) != (steps & 1);
+    m_rot90 = steps;
+    if (oddChanged && m_fitMode) fit();
+    update();
+}
+
 void ImageView::setMessage(const QString& msg)
 {
     m_message = msg;
@@ -220,7 +342,6 @@ void ImageView::setMessage(const QString& msg)
 void ImageView::setViewTransform(double zoom, QPointF offset, bool fitMode)
 {
     if (fitMode) {
-        // Mỗi khung tự vừa theo kích thước của nó (hai khung có thể rộng khác nhau).
         fitSilently();
         return;
     }
@@ -261,7 +382,7 @@ void ImageView::setZoom(double z, QPointF anchor)
     if (imageSize().isEmpty()) return;
     z = qBound(0.01, z, 64.0);
     if (anchor.x() < 0) anchor = QPointF(width() / 2.0, height() / 2.0);
-    QPointF img = widgetToImage(anchor);
+    QPointF img = (anchor - m_offset) / m_zoom;
     m_zoom = z;
     m_offset = anchor - img * z;
     m_fitMode = false;
@@ -270,7 +391,26 @@ void ImageView::setZoom(double z, QPointF anchor)
     update();
 }
 
-QPointF ImageView::widgetToImage(QPointF p) const { return (p - m_offset) / m_zoom; }
+QPointF ImageView::displayToSource(QPointF dp) const
+{
+    const auto& s = m_layers[0].src;
+    if (!s || s->empty()) return dp;
+    QSize ds = imageSize();
+    double u = dp.x() / ds.width();
+    double v = dp.y() / ds.height();
+    if (m_flipH) u = 1.0 - u;
+    if (m_flipV) v = 1.0 - v;
+    double su = u, sv = v;
+    if (m_rot90 == 1) { su = v; sv = 1.0 - u; }
+    else if (m_rot90 == 2) { su = 1.0 - u; sv = 1.0 - v; }
+    else if (m_rot90 == 3) { su = 1.0 - v; sv = u; }
+    return QPointF(su * s->width, sv * s->height);
+}
+
+QPointF ImageView::widgetToSourceImage(QPointF p) const
+{
+    return displayToSource((p - m_offset) / m_zoom);
+}
 
 // ---------------------------------------------------------------- GL
 void ImageView::initializeGL()
@@ -315,12 +455,22 @@ void ImageView::freeLayerGl(Layer& L, bool texToo)
 {
     for (auto& l : L.luts) glDeleteTextures(1, &l.id);
     L.luts.clear();
+    L.uniformLocs.clear();
     delete L.prog;
     L.prog = nullptr;
-    if (texToo && L.tex) {
-        glDeleteTextures(1, &L.tex);
-        L.tex = 0;
-        L.texW = L.texH = 0;
+    if (texToo) {
+        if (L.tex) {
+            glDeleteTextures(1, &L.tex);
+            L.tex = 0;
+            L.texW = L.texH = 0;
+        }
+        for (int i = 0; i < 2; ++i) {
+            if (L.pbo[i]) {
+                glDeleteBuffers(1, &L.pbo[i]);
+                L.pbo[i] = 0;
+                L.pboBytes[i] = 0;
+            }
+        }
     }
 }
 
@@ -396,14 +546,32 @@ void ImageView::uploadImage(Layer& L)
     if (!L.tex) glGenTextures(1, &L.tex);
     glBindTexture(GL_TEXTURE_2D, L.tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    // File gốc là half -> RGBA16F không mất gì, nửa bộ nhớ GPU. Còn lại RGBA32F: giữ nguyên
-    // giá trị lớn (depth, position) — RGBA16F sẽ tràn thành Inf > 65504.
     const bool half = L.src->isHalf();
     const GLenum type = half ? GL_HALF_FLOAT : GL_FLOAT;
     const void* data = half ? (const void*)L.src->rgbaHalf.data() : (const void*)L.src->rgba.data();
+    const size_t dataBytes = L.src->bytes();
+
     if (L.texW == L.src->width && L.texH == L.src->height && L.texHalf == half) {
-        // Frame kế tiếp của sequence (cùng kích thước): ghi đè vào vùng nhớ GPU đã có, không cấp phát lại.
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, L.src->width, L.src->height, GL_RGBA, type, data);
+        // Dùng double-buffered PBO khi play sequence để DMA bất đồng bộ, tránh nghẽn CPU-GPU.
+        bool uploadedViaPbo = false;
+        if (m_playback && dataBytes > 0) {
+            int idx = L.pboIdx;
+            L.pboIdx = (L.pboIdx + 1) & 1;
+            if (!L.pbo[idx]) glGenBuffers(1, &L.pbo[idx]);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, L.pbo[idx]);
+            glBufferData(GL_PIXEL_UNPACK_BUFFER, (GLsizeiptr)dataBytes, nullptr, GL_STREAM_DRAW);
+            void* mapped = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, (GLsizeiptr)dataBytes,
+                                            GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+            if (mapped) {
+                std::memcpy(mapped, data, dataBytes);
+                glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, L.src->width, L.src->height, GL_RGBA, type, nullptr);
+                uploadedViaPbo = true;
+            }
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        }
+        if (!uploadedViaPbo)
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, L.src->width, L.src->height, GL_RGBA, type, data);
     } else {
         glTexImage2D(GL_TEXTURE_2D, 0, half ? GL_RGBA16F : GL_RGBA32F, L.src->width, L.src->height, 0, GL_RGBA, type,
                      data);
@@ -413,14 +581,11 @@ void ImageView::uploadImage(Layer& L)
         L.texH = L.src->height;
         L.texHalf = half;
     }
-    L.mipsValid = false; // mipmap chỉ tạo khi thật sự cần (bindFiltered)
+    L.mipsValid = false;
     glBindTexture(GL_TEXTURE_2D, 0);
     L.texDirty = false;
 }
 
-// Đặt bộ lọc cho texture đang bind. Thu nhỏ: mipmap (lọc trong không gian tuyến tính, trước OCIO);
-// phóng to: giữ pixel sắc nét. Khi đang play sequence bỏ qua mipmap (tốn GPU mỗi frame) và dùng
-// lọc tuyến tính — dừng play là tạo lại ngay.
 void ImageView::bindFiltered(Layer& L)
 {
     const bool minify = m_zoom < 1.0;
@@ -429,7 +594,8 @@ void ImageView::bindFiltered(Layer& L)
         glGenerateMipmap(GL_TEXTURE_2D);
         L.mipsValid = true;
     }
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, mips ? GL_LINEAR_MIPMAP_LINEAR : (minify ? GL_LINEAR : GL_NEAREST));
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                    mips ? GL_LINEAR_MIPMAP_LINEAR : (minify ? GL_LINEAR : GL_NEAREST));
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, minify ? GL_LINEAR : GL_NEAREST);
 }
 
@@ -442,7 +608,7 @@ void ImageView::setPlayback(bool on)
 
 void ImageView::paintGL()
 {
-    QColor bg(38, 38, 40);
+    QColor bg = bgClearColor(m_bgMode);
     if (m_glOk) {
         glClearColor(bg.redF(), bg.greenF(), bg.blueF(), 1.f);
         glClear(GL_COLOR_BUFFER_BIT);
@@ -459,7 +625,7 @@ void ImageView::paintGL()
                     reason = tr("CPU (ảnh lớn hơn %1 px)").arg(m_maxTex);
                     break;
                 }
-                if (m_mode == CompareMode::Difference && two) continue; // Difference không cần OCIO
+                if (m_mode == CompareMode::Difference && two) continue;
                 if (L.shaderDirty) {
                     QString err;
                     L.shaderDirty = false;
@@ -485,7 +651,6 @@ void ImageView::paintGL()
         } else if (two && m_mode == CompareMode::Difference) {
             drawDiffGpu();
         } else if (two) {
-            // Wipe: A ở bên trái đường chia, B bên phải (cắt bằng scissor theo pixel thiết bị).
             const qreal dpr = devicePixelRatioF();
             const int W = (int)std::lround(width() * dpr), H = (int)std::lround(height() * dpr);
             const int split = qBound(0, (int)std::lround(wipeX() * dpr), W);
@@ -507,12 +672,19 @@ void ImageView::drawLayerGpu(Layer& L)
     if (L.texDirty) uploadImage(L);
     const qreal dpr = devicePixelRatioF();
     glViewport(0, 0, (GLsizei)(width() * dpr), (GLsizei)(height() * dpr));
+    const QSize disp = (m_rot90 & 1) ? QSize(L.src->height, L.src->width) : QSize(L.src->width, L.src->height);
     L.prog->bind();
     L.prog->setUniformValue("viewSize", QVector2D(width(), height()));
     L.prog->setUniformValue("origin", QVector2D(m_offset));
-    L.prog->setUniformValue("drawSize", QVector2D(L.src->width * m_zoom, L.src->height * m_zoom));
+    L.prog->setUniformValue("drawSize", QVector2D(disp.width() * m_zoom, disp.height() * m_zoom));
+    L.prog->setUniformValue("flipH", m_flipH ? 1 : 0);
+    L.prog->setUniformValue("flipV", m_flipV ? 1 : 0);
+    L.prog->setUniformValue("rot90", m_rot90);
     L.prog->setUniformValue("exrv_channel", (int)L.vs.channel);
     L.prog->setUniformValue("exrv_invGamma", 1.0f / qMax(0.01f, L.vs.gamma));
+    L.prog->setUniformValue("exrv_bgMode", (int)m_bgMode);
+    L.prog->setUniformValue("exrv_inspectMode", (int)m_inspectMode);
+    L.prog->setUniformValue("exrv_exposure", L.vs.exposure);
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, L.tex);
@@ -525,7 +697,10 @@ void ImageView::drawLayerGpu(Layer& L)
     }
     GLuint pid = L.prog->programId();
     for (const auto& u : L.pipe->gpuUniforms(L.vs.exposure)) {
-        GLint loc = glGetUniformLocation(pid, u.name.c_str());
+        QByteArray key = QByteArray::fromStdString(u.name);
+        auto it = L.uniformLocs.constFind(key);
+        GLint loc = (it != L.uniformLocs.constEnd()) ? *it : glGetUniformLocation(pid, u.name.c_str());
+        if (it == L.uniformLocs.constEnd()) L.uniformLocs.insert(key, loc);
         if (loc < 0) continue;
         switch (u.type) {
         case exrv::GpuUniformValue::Double:
@@ -565,10 +740,14 @@ void ImageView::drawDiffGpu()
     if (B.texDirty) uploadImage(B);
     const qreal dpr = devicePixelRatioF();
     glViewport(0, 0, (GLsizei)(width() * dpr), (GLsizei)(height() * dpr));
+    const QSize disp = imageSize();
     m_diffProg->bind();
     m_diffProg->setUniformValue("viewSize", QVector2D(width(), height()));
     m_diffProg->setUniformValue("origin", QVector2D(m_offset));
-    m_diffProg->setUniformValue("drawSize", QVector2D(A.src->width * m_zoom, A.src->height * m_zoom));
+    m_diffProg->setUniformValue("drawSize", QVector2D(disp.width() * m_zoom, disp.height() * m_zoom));
+    m_diffProg->setUniformValue("flipH", m_flipH ? 1 : 0);
+    m_diffProg->setUniformValue("flipV", m_flipV ? 1 : 0);
+    m_diffProg->setUniformValue("rot90", m_rot90);
     m_diffProg->setUniformValue("scaleB", QVector2D((float)A.src->width / B.src->width, (float)A.src->height / B.src->height));
     m_diffProg->setUniformValue("gain", (float)std::exp2(A.vs.exposure));
     m_diffProg->setUniformValue("channel", (int)A.vs.channel);
@@ -653,11 +832,23 @@ void ImageView::drawCpu()
     Layer& A = m_layers[0];
     const bool two = twoLayers();
     QPainter p(this);
-    if (!m_glOk) p.fillRect(rect(), QColor(38, 38, 40));
+    if (!m_glOk) p.fillRect(rect(), bgClearColor(m_bgMode));
     p.setRenderHint(QPainter::SmoothPixmapTransform, m_zoom < 1.0);
+    auto transformImg = [&](const QImage& img) -> QImage {
+        QImage out = img;
+        if (m_rot90 != 0) {
+            QTransform tr;
+            tr.rotate(m_rot90 * 90);
+            out = out.transformed(tr);
+        }
+        if (m_flipH || m_flipV) out = out.mirrored(m_flipH, m_flipV);
+        return out;
+    };
+    const QSize ds = imageSize();
+    const QRectF target(m_offset, QSizeF(ds.width() * m_zoom, ds.height() * m_zoom));
     if (two && m_mode == CompareMode::Difference) {
         updateDiffCpu();
-        p.drawImage(QRectF(m_offset, QSizeF(A.src->width * m_zoom, A.src->height * m_zoom)), m_diffImage);
+        p.drawImage(target, transformImg(m_diffImage));
         return;
     }
     if (two) {
@@ -665,36 +856,34 @@ void ImageView::drawCpu()
         const double split = wipeX();
         if (updateCpuImage(A)) {
             p.setClipRect(QRectF(0, 0, split, height()));
-            p.drawImage(QRectF(m_offset, QSizeF(A.src->width * m_zoom, A.src->height * m_zoom)), A.cpuImage);
+            p.drawImage(target, transformImg(A.cpuImage));
         }
         if (updateCpuImage(B)) {
             p.setClipRect(QRectF(split, 0, width() - split, height()));
-            p.drawImage(QRectF(m_offset, QSizeF(B.src->width * m_zoom, B.src->height * m_zoom)), B.cpuImage);
+            p.drawImage(target, transformImg(B.cpuImage));
         }
         return;
     }
-    if (updateCpuImage(A))
-        p.drawImage(QRectF(m_offset, QSizeF(A.src->width * m_zoom, A.src->height * m_zoom)), A.cpuImage);
+    if (updateCpuImage(A)) p.drawImage(target, transformImg(A.cpuImage));
 }
 
 void ImageView::drawOverlay()
 {
     QPainter p(this);
     const auto& src = m_layers[0].src;
-    if (!m_glOk && (!src || src->empty())) p.fillRect(rect(), QColor(38, 38, 40));
+    if (!m_glOk && (!src || src->empty())) p.fillRect(rect(), bgClearColor(m_bgMode));
     auto badge = [&](const QRectF& r, const QString& text) {
         QFont f = font();
         f.setBold(true);
-        f.setPointSizeF(f.pointSizeF() * 1.4);
+        f.setPointSizeF(f.pointSizeF() * 1.25);
         p.setFont(f);
-        p.fillRect(r, QColor(0, 0, 0, 140));
+        p.fillRect(r, QColor(0, 0, 0, 155));
         p.setPen(QColor(255, 255, 255));
         p.drawText(r, Qt::AlignCenter, text);
         p.setFont(font());
     };
     const bool two = twoLayers();
     if (two && m_mode == CompareMode::Wipe) {
-        // Đường chia + nhãn A/B hai bên + tay nắm ở giữa.
         const double x = wipeX();
         p.setPen(QPen(QColor(0, 0, 0, 160), 3));
         p.drawLine(QPointF(x, 0), QPointF(x, height()));
@@ -703,30 +892,65 @@ void ImageView::drawOverlay()
         p.setBrush(QColor(255, 255, 255));
         p.drawEllipse(QPointF(x, height() / 2.0), 6, 6);
         p.setBrush(Qt::NoBrush);
-        badge(QRectF(x - 44, 8, 36, 28), "A");
-        badge(QRectF(x + 8, 8, 36, 28), "B");
+        badge(QRectF(x - 44, 8, 36, 26), "A");
+        badge(QRectF(x + 8, 8, 36, 26), "B");
     } else if (two && m_mode == CompareMode::Difference) {
-        badge(QRectF(width() - 104, 8, 96, 28), "|A − B|");
+        badge(QRectF(width() - 104, 8, 96, 26), "|A − B|");
     } else if (!m_label.isEmpty()) {
-        badge(QRectF(width() - 44, 8, 36, 28), m_label); // nhãn khung (A / B) ở góc phải trên
+        badge(QRectF(width() - 44, 8, 36, 26), m_label);
     }
+
+    if (m_inspectMode == InspectMode::FalseColor)
+        badge(QRectF(10, 8, 108, 24), QStringLiteral("FALSE COLOR"));
+    else if (m_inspectMode == InspectMode::Clipping)
+        badge(QRectF(10, 8, 128, 24), QStringLiteral("CLIP / NaN / NEG"));
+
     if (!src || src->empty()) {
         p.setPen(QColor(150, 150, 155));
         p.drawText(rect(), Qt::AlignCenter,
                    m_message.isEmpty() ? tr("Kéo thả file .exr vào đây hoặc nhấn Ctrl+O") : m_message);
         return;
     }
-    QRectF target(m_offset, QSizeF(src->width * m_zoom, src->height * m_zoom));
+
+    const QSize ds = imageSize();
+    QRectF target(m_offset, QSizeF(ds.width() * m_zoom, ds.height() * m_zoom));
     p.setPen(QPen(QColor(90, 90, 95), 1, Qt::DashLine));
     p.setBrush(Qt::NoBrush);
     p.drawRect(target.adjusted(-0.5, -0.5, 0.5, 0.5));
-    if (src->hasOverscan()) {
-        // Khung display window khi đang xem cả vùng overscan.
+
+    // Lưới pixel khi zoom >= 800%
+    if (m_pixelGrid && m_zoom >= 8.0 && !m_playback) {
+        QRectF vis = target.intersected(QRectF(rect()));
+        if (!vis.isEmpty()) {
+            int x0 = qMax(0, (int)qFloor((vis.left() - m_offset.x()) / m_zoom));
+            int x1 = qMin(ds.width(), (int)qCeil((vis.right() - m_offset.x()) / m_zoom));
+            int y0 = qMax(0, (int)qFloor((vis.top() - m_offset.y()) / m_zoom));
+            int y1 = qMin(ds.height(), (int)qCeil((vis.bottom() - m_offset.y()) / m_zoom));
+            p.setPen(QPen(QColor(255, 255, 255, m_zoom >= 16.0 ? 45 : 25), 1));
+            for (int x = x0; x <= x1; ++x) {
+                double sx = m_offset.x() + x * m_zoom;
+                p.drawLine(QPointF(sx, vis.top()), QPointF(sx, vis.bottom()));
+            }
+            for (int y = y0; y <= y1; ++y) {
+                double sy = m_offset.y() + y * m_zoom;
+                p.drawLine(QPointF(vis.left(), sy), QPointF(vis.right(), sy));
+            }
+        }
+    }
+
+    if (src->hasOverscan() && m_rot90 == 0 && !m_flipH && !m_flipV) {
         QRectF disp(m_offset + QPointF(src->dispX, src->dispY) * m_zoom,
                     QSizeF(src->dispW * m_zoom, src->dispH * m_zoom));
         p.setPen(QPen(QColor(255, 200, 60), 1, Qt::SolidLine));
         p.drawRect(disp.adjusted(-0.5, -0.5, 0.5, 0.5));
         p.drawText(disp.topLeft() + QPointF(4, -4), tr("display window"));
+    }
+    if (m_selecting) {
+        QRectF sr = QRectF(m_selStart, m_selEnd).normalized();
+        p.setPen(QPen(QColor(232, 140, 40), 1.5, Qt::DashLine));
+        p.setBrush(QColor(232, 140, 40, 28));
+        p.drawRect(sr);
+        p.setBrush(Qt::NoBrush);
     }
     if (two && m_mode == CompareMode::Difference) {
         p.setPen(QColor(200, 200, 205));
@@ -755,8 +979,15 @@ void ImageView::wheelEvent(QWheelEvent* e)
 
 void ImageView::mousePressEvent(QMouseEvent* e)
 {
+    if (e->button() == Qt::LeftButton && (e->modifiers() & Qt::ShiftModifier) && !imageSize().isEmpty()) {
+        m_selecting = true;
+        m_selStart = m_selEnd = e->position();
+        setCursor(Qt::CrossCursor);
+        update();
+        return;
+    }
     if (e->button() == Qt::LeftButton && nearWipe(e->position())) {
-        m_draggingWipe = true; // kéo đường wipe thay vì pan
+        m_draggingWipe = true;
         return;
     }
     if (e->button() == Qt::LeftButton || e->button() == Qt::MiddleButton) {
@@ -769,6 +1000,11 @@ void ImageView::mousePressEvent(QMouseEvent* e)
 
 void ImageView::mouseMoveEvent(QMouseEvent* e)
 {
+    if (m_selecting) {
+        m_selEnd = e->position();
+        update();
+        return;
+    }
     if (m_draggingWipe) {
         m_wipe = qBound(0.0, e->position().x() / qMax(1, width()), 1.0);
         update();
@@ -785,8 +1021,24 @@ void ImageView::mouseMoveEvent(QMouseEvent* e)
     emitHover(e->position());
 }
 
-void ImageView::mouseReleaseEvent(QMouseEvent*)
+void ImageView::mouseReleaseEvent(QMouseEvent* e)
 {
+    if (m_selecting) {
+        m_selecting = false;
+        unsetCursor();
+        update();
+        const auto& src = m_layers[0].src;
+        if (src && !src->empty()) {
+            QPointF p0 = widgetToSourceImage(m_selStart);
+            QPointF p1 = widgetToSourceImage(e->position());
+            int x0 = qBound(0, (int)qFloor(qMin(p0.x(), p1.x())), src->width - 1);
+            int y0 = qBound(0, (int)qFloor(qMin(p0.y(), p1.y())), src->height - 1);
+            int x1 = qBound(0, (int)qFloor(qMax(p0.x(), p1.x())), src->width - 1);
+            int y1 = qBound(0, (int)qFloor(qMax(p0.y(), p1.y())), src->height - 1);
+            emit regionSelected(QRect(QPoint(x0, y0), QPoint(x1, y1)));
+        }
+        return;
+    }
     m_dragging = false;
     m_draggingWipe = false;
     unsetCursor();
@@ -795,7 +1047,7 @@ void ImageView::mouseReleaseEvent(QMouseEvent*)
 void ImageView::mouseDoubleClickEvent(QMouseEvent* e)
 {
     if (nearWipe(e->position())) {
-        m_wipe = 0.5; // double-click đường wipe: về giữa
+        m_wipe = 0.5;
         update();
         return;
     }
@@ -812,11 +1064,11 @@ void ImageView::leaveEvent(QEvent*) { emit hovered(-1, -1, false); }
 
 void ImageView::emitHover(QPointF widgetPos)
 {
-    QSize s = imageSize();
-    if (s.isEmpty()) return;
-    QPointF ip = widgetToImage(widgetPos);
+    const auto& src = m_layers[0].src;
+    if (!src || src->empty()) return;
+    QPointF ip = widgetToSourceImage(widgetPos);
     int x = (int)qFloor(ip.x()), y = (int)qFloor(ip.y());
-    emit hovered(x, y, x >= 0 && y >= 0 && x < s.width() && y < s.height());
+    emit hovered(x, y, x >= 0 && y >= 0 && x < src->width && y < src->height);
 }
 
 void ImageView::dragEnterEvent(QDragEnterEvent* e)

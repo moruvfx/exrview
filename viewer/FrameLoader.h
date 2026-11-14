@@ -9,6 +9,7 @@
 #include <QString>
 #include <QThreadPool>
 
+#include <atomic>
 #include <memory>
 
 // Layer người dùng đang chọn — giữ theo tên để áp dụng cho mọi frame trong sequence.
@@ -43,9 +44,10 @@ public:
     void setOverscan(bool on) { m_overscan = on; }
     bool overscan() const { return m_overscan; }
     FramePtr cached(const QString& key) const;
+    bool isCached(const QString& key) const { return m_cache.contains(key); }
     bool isPending(const QString& key) const { return m_pending.contains(key); }
     int pendingCount() const { return m_pending.size(); }
-    void request(const QString& path, const LayerRef& ref);
+    void request(const QString& path, const LayerRef& ref, int priority = 0);
     void clear();
     void setBudgetMB(int mb) { m_cache.setMaxCost(mb); }
     int budgetMB() const { return (int)m_cache.maxCost(); }
@@ -57,10 +59,11 @@ signals:
     void loaded(const QString& key, FramePtr frame);
 
 private:
-    void finished(const QString& key, FramePtr frame);
+    void finished(uint64_t gen, const QString& key, FramePtr frame);
 
     QThreadPool m_pool;
     QCache<QString, FramePtr> m_cache;
     QSet<QString> m_pending;
+    std::atomic<uint64_t> m_gen{1};
     bool m_overscan = false;
 };

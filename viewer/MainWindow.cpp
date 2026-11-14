@@ -1,9 +1,12 @@
 #include "MainWindow.h"
+#include "HistogramDock.h"
 #include "ImageView.h"
+#include "TimelineSlider.h"
 
 #include <QAction>
 #include <QActionGroup>
 #include <QApplication>
+#include <QClipboard>
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QCoreApplication>
@@ -15,6 +18,7 @@
 #include <QFontDatabase>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QImageWriter>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QMenuBar>
@@ -25,12 +29,13 @@
 #include <QStatusBar>
 #include <QToolBar>
 #include <QToolButton>
+#include <QTransform>
 #include <QTreeWidget>
 #include <QVBoxLayout>
 
 #include <algorithm>
 #include <cmath>
-
+#include <limits>
 
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -59,7 +64,7 @@ QString humanSize(qint64 b)
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
 {
     setWindowTitle("ExrView");
-    resize(1400, 860);
+    resize(1440, 900);
     buildUi();
     buildMenus();
     loadSettings();
@@ -76,6 +81,7 @@ void MainWindow::buildUi()
 {
     m_view = new ImageView(&m_pipeline, this);
     connect(m_view, &ImageView::hovered, this, &MainWindow::updateHover);
+    connect(m_view, &ImageView::regionSelected, this, &MainWindow::onRegionSelected);
     connect(m_view, &ImageView::fileDropped, this, &MainWindow::openFile);
     connect(m_view, &ImageView::rendererChanged, this, [this](const QString& r) { m_rendererLabel->setText(r); });
     connect(m_view, &ImageView::zoomChanged, this,
@@ -97,7 +103,7 @@ void MainWindow::buildUi()
     m_seqBar->hide();
     setCentralWidget(central);
 
-    // --- Toolbar: layer / channel
+    // --- Toolbar 1: Layer / Channel / Inspect / Background
     auto* tb = addToolBar(tr("Layer"));
     tb->setObjectName("layerBar");
     tb->setMovable(false);
@@ -112,6 +118,35 @@ void MainWindow::buildUi()
     for (auto* n : kChannelNames) m_channelCombo->addItem(n);
     tb->addWidget(m_channelCombo);
 
+    tb->addSeparator();
+    tb->addWidget(new QLabel(tr(" Nền ")));
+    m_bgCombo = new QComboBox;
+    m_bgCombo->addItem(tr("Tối"));
+    m_bgCombo->addItem(tr("Đen"));
+    m_bgCombo->addItem(tr("Xám 18%"));
+    m_bgCombo->addItem(tr("Caro (Alpha)"));
+    m_bgCombo->setToolTip(tr("Màu nền & hiển thị Alpha (phím T bật/tắt Caro)"));
+    tb->addWidget(m_bgCombo);
+
+    tb->addWidget(new QLabel(tr("  Kiểm tra ")));
+    m_inspectCombo = new QComboBox;
+    m_inspectCombo->addItem(tr("Bình thường"));
+    m_inspectCombo->addItem(tr("False Color"));
+    m_inspectCombo->addItem(tr("Clip / NaN / Âm"));
+    m_inspectCombo->setToolTip(tr("Chế độ phân tích phơi sáng & lỗi pixel (Shift+F / Shift+Z)"));
+    tb->addWidget(m_inspectCombo);
+
+    connect(m_bgCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int idx) {
+        auto m = (ImageView::BgMode)idx;
+        m_view->setBgMode(m);
+        if (m_viewB) m_viewB->setBgMode(m);
+    });
+    connect(m_inspectCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int idx) {
+        auto m = (ImageView::InspectMode)idx;
+        m_view->setInspectMode(m);
+        if (m_viewB) m_viewB->setInspectMode(m);
+    });
+
     connect(m_layerCombo, QOverload<int>::of(&QComboBox::activated), this, [this](int idx) {
         if (!m_frame || idx < 0) return;
         QPoint pl = m_layerCombo->itemData(idx).toPoint();
@@ -124,7 +159,7 @@ void MainWindow::buildUi()
     });
     connect(m_channelCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this] { render(); });
 
-    // --- Toolbar: màu
+    // --- Toolbar 2: Màu / Exposure / Gamma
     addToolBarBreak();
     auto* cb = addToolBar(tr("Màu"));
     cb->setObjectName("colorBar");
@@ -136,11 +171,11 @@ void MainWindow::buildUi()
     cb->addWidget(m_inputCombo);
     cb->addWidget(new QLabel(tr("  Display ")));
     m_displayCombo = new QComboBox;
-    m_displayCombo->setMinimumWidth(160);
+    m_displayCombo->setMinimumWidth(150);
     cb->addWidget(m_displayCombo);
     cb->addWidget(new QLabel(tr("  View ")));
     m_viewCombo = new QComboBox;
-    m_viewCombo->setMinimumWidth(200);
+    m_viewCombo->setMinimumWidth(190);
     cb->addWidget(m_viewCombo);
 
     cb->addWidget(new QLabel(tr("  Exposure ")));
@@ -225,6 +260,14 @@ void MainWindow::buildUi()
     addDockWidget(Qt::RightDockWidgetArea, m_infoDock);
     m_infoDock->hide();
     connect(m_infoDock, &QDockWidget::visibilityChanged, this, [this](bool v) { if (v) updateInfoDock(); });
+
+    // --- Dock Histogram & Thống kê
+    m_histDock = new HistogramDock(this);
+    addDockWidget(Qt::RightDockWidgetArea, m_histDock);
+    m_histDock->hide();
+    connect(m_histDock, &QDockWidget::visibilityChanged, this, [this](bool v) {
+        if (v) updateHistogram();
+    });
 }
 
 QWidget* MainWindow::buildSequenceBar()
@@ -232,6 +275,7 @@ QWidget* MainWindow::buildSequenceBar()
     auto* bar = new QWidget;
     auto* l = new QHBoxLayout(bar);
     l->setContentsMargins(8, 4, 8, 4);
+    l->setSpacing(4);
     auto mk = [&](const QString& text, const QString& tip, auto fn) {
         auto* b = new QToolButton;
         b->setText(text);
@@ -241,13 +285,32 @@ QWidget* MainWindow::buildSequenceBar()
         l->addWidget(b);
         return b;
     };
-    mk("⏮", tr("Frame đầu (Home)"), [this] { showIndex(0); });
+    mk("⏮", tr("Frame đầu (Home)"), [this] { showIndex(effectiveIn()); });
     mk("◀", tr("Frame trước (←)"), [this] { stepFrame(-1); });
     m_playBtn = mk("▶", tr("Play / Pause (Space)"), [this] { togglePlay(); });
     mk("▶|", tr("Frame sau (→)"), [this] { stepFrame(1); });
-    mk("⏭", tr("Frame cuối (End)"), [this] { showIndex(m_frames.size() - 1); });
+    mk("⏭", tr("Frame cuối (End)"), [this] { showIndex(effectiveOut()); });
+    m_loopBtn = mk("🔁", tr("Chế độ lặp: Loop (bấm để đổi Loop / Ping-Pong / Once)"), [this] { cycleLoopMode(); });
 
-    m_seqSlider = new QSlider(Qt::Horizontal);
+    mk("In", tr("Đặt điểm In tại frame hiện tại"), [this] {
+        if (m_frames.size() < 2) return;
+        m_inFrame = m_index;
+        if (m_outFrame >= 0 && m_outFrame < m_inFrame) m_outFrame = m_inFrame;
+        m_seqSlider->setInOutRange(m_inFrame, m_outFrame);
+    });
+    mk("Out", tr("Đặt điểm Out tại frame hiện tại"), [this] {
+        if (m_frames.size() < 2) return;
+        m_outFrame = m_index;
+        if (m_inFrame > m_outFrame) m_inFrame = m_outFrame;
+        m_seqSlider->setInOutRange(m_inFrame, m_outFrame);
+    });
+    mk("×", tr("Xoá giới hạn In/Out"), [this] {
+        m_inFrame = 0;
+        m_outFrame = -1;
+        m_seqSlider->setInOutRange(0, -1);
+    });
+
+    m_seqSlider = new TimelineSlider;
     l->addWidget(m_seqSlider, 1);
     connect(m_seqSlider, &QSlider::valueChanged, this, [this](int v) {
         if (!m_updatingUi && v != m_index) showIndex(v);
@@ -271,7 +334,6 @@ QWidget* MainWindow::buildSequenceBar()
     return bar;
 }
 
-// Khung B của chế độ so sánh: thanh chọn layer/pass + color space riêng, phía trên ImageView thứ hai.
 QWidget* MainWindow::buildComparePanel()
 {
     auto* panel = new QWidget;
@@ -310,9 +372,15 @@ QWidget* MainWindow::buildComparePanel()
     m_bChannelCombo = new QComboBox;
     for (auto* n : kChannelNames) m_bChannelCombo->addItem(n);
     row1->addWidget(m_bChannelCombo);
+
+    auto* openBBtn = new QToolButton;
+    openBBtn->setText(tr("Mở B…"));
+    openBBtn->setToolTip(tr("Mở file EXR riêng cho khung B (Ctrl+Shift+O)"));
+    row1->addWidget(openBBtn);
+
     auto* copyBtn = new QToolButton;
     copyBtn->setText(tr("B = A"));
-    copyBtn->setToolTip(tr("Chép layer và cài đặt màu của khung A sang khung B"));
+    copyBtn->setToolTip(tr("Đưa B về cùng file/layer và cài đặt màu của A"));
     row1->addWidget(copyBtn);
 
     row2->addWidget(new QLabel(tr("Input")));
@@ -335,7 +403,7 @@ QWidget* MainWindow::buildComparePanel()
 
     m_viewB = new ImageView(&m_pipelineB, panel);
     m_viewB->setLabel("B");
-    m_view->setSecondPipeline(&m_pipelineB); // lớp B trong chế độ Wipe/Difference
+    m_view->setSecondPipeline(&m_pipelineB);
     v->addWidget(m_viewB, 1);
 
     connect(m_bLayerCombo, QOverload<int>::of(&QComboBox::activated), this, [this](int idx) {
@@ -363,12 +431,17 @@ QWidget* MainWindow::buildComparePanel()
     connect(m_bExpSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this] {
         if (!m_updatingUi) renderB();
     });
+    connect(openBBtn, &QToolButton::clicked, this, [this] {
+        QSettings s;
+        QString f = QFileDialog::getOpenFileName(this, tr("Mở file EXR cho khung B"), s.value("lastDir").toString(),
+                                                 tr("OpenEXR (*.exr *.sxr);;Tất cả (*)"));
+        if (!f.isEmpty()) openFileB(f);
+    });
     connect(copyBtn, &QToolButton::clicked, this, &MainWindow::copyAtoB);
     connect(m_bModeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this] { applyCompareLayout(); });
 
     connect(m_viewB, &ImageView::hovered, this, &MainWindow::updateHover);
-    connect(m_viewB, &ImageView::fileDropped, this, &MainWindow::openFile);
-    // Zoom/pan đồng bộ hai chiều: cùng vùng ảnh nằm cùng chỗ trên hai khung.
+    connect(m_viewB, &ImageView::fileDropped, this, &MainWindow::openFileB);
     connect(m_view, &ImageView::viewChanged, this, [this](double z, QPointF o, bool fit) {
         if (m_compare && !m_syncingView) m_viewB->setViewTransform(z, o, fit);
     });
@@ -387,12 +460,24 @@ void MainWindow::buildMenus()
                                                  tr("OpenEXR (*.exr *.sxr);;Tất cả (*)"));
         if (!f.isEmpty()) openFile(f);
     });
+    file->addAction(tr("Mở file cho khung &B..."), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_O), this, [this] {
+        QSettings s;
+        QString f = QFileDialog::getOpenFileName(this, tr("Mở file EXR cho khung B"), s.value("lastDir").toString(),
+                                                 tr("OpenEXR (*.exr *.sxr);;Tất cả (*)"));
+        if (!f.isEmpty()) openFileB(f);
+    });
     m_recentMenu = file->addMenu(tr("Mở gần đây"));
     rebuildRecentMenu();
     file->addAction(tr("Mở lại"), QKeySequence(Qt::Key_F5), this, [this] {
         m_loader.clear();
+        updateTimelineCache();
         showIndex(m_index);
     });
+    file->addSeparator();
+    file->addAction(tr("&Xuất ảnh (PNG/JPG/TIFF)..."), QKeySequence::Save, this, &MainWindow::exportImage);
+    file->addAction(tr("&Chép ảnh vào Clipboard"), QKeySequence::Copy, this, &MainWindow::copyImageToClipboard);
+    file->addAction(tr("Chép giá trị pixel (RGBA float)"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_C), this,
+                    &MainWindow::copyPixelToClipboard);
     file->addSeparator();
     file->addAction(tr("Thoát"), QKeySequence::Quit, this, &QWidget::close);
 
@@ -418,6 +503,57 @@ void MainWindow::buildMenus()
         m_gammaSpin->setValue(1);
     });
     view->addSeparator();
+    view->addAction(tr("Bật/tắt nền Caro Alpha"), QKeySequence(Qt::Key_T), this, [this] {
+        m_bgCombo->setCurrentIndex(m_bgCombo->currentIndex() == 3 ? 0 : 3);
+    });
+    view->addAction(tr("False Color (Heatmap phơi sáng)"), QKeySequence(Qt::SHIFT | Qt::Key_F), this, [this] {
+        m_inspectCombo->setCurrentIndex(m_inspectCombo->currentIndex() == 1 ? 0 : 1);
+    });
+    view->addAction(tr("Đánh dấu Clip / NaN / Âm"), QKeySequence(Qt::SHIFT | Qt::Key_Z), this, [this] {
+        m_inspectCombo->setCurrentIndex(m_inspectCombo->currentIndex() == 2 ? 0 : 2);
+    });
+    auto* gridAct = view->addAction(tr("Hiện lưới pixel khi zoom ≥ 800%"));
+    gridAct->setCheckable(true);
+    gridAct->setChecked(true);
+    gridAct->setShortcut(QKeySequence(Qt::SHIFT | Qt::Key_G));
+    connect(gridAct, &QAction::toggled, this, [this](bool on) {
+        m_view->setPixelGrid(on);
+        if (m_viewB) m_viewB->setPixelGrid(on);
+    });
+
+    auto* xform = view->addMenu(tr("Xoay / Lật"));
+    xform->addAction(tr("Lật ngang (H)"), QKeySequence(Qt::Key_H), this, [this] {
+        bool on = !m_view->flipH();
+        m_view->setFlipH(on);
+        if (m_viewB) m_viewB->setFlipH(on);
+    });
+    xform->addAction(tr("Lật dọc (Shift+H)"), QKeySequence(Qt::SHIFT | Qt::Key_H), this, [this] {
+        bool on = !m_view->flipV();
+        m_view->setFlipV(on);
+        if (m_viewB) m_viewB->setFlipV(on);
+    });
+    xform->addAction(tr("Xoay 90° phải"), QKeySequence(Qt::CTRL | Qt::Key_R), this, [this] {
+        int r = (m_view->rot90() + 1) % 4;
+        m_view->setRot90(r);
+        if (m_viewB) m_viewB->setRot90(r);
+    });
+    xform->addAction(tr("Xoay 90° trái"), QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_R), this, [this] {
+        int r = (m_view->rot90() + 3) % 4;
+        m_view->setRot90(r);
+        if (m_viewB) m_viewB->setRot90(r);
+    });
+    xform->addAction(tr("Reset xoay / lật"), this, [this] {
+        m_view->setFlipH(false);
+        m_view->setFlipV(false);
+        m_view->setRot90(0);
+        if (m_viewB) {
+            m_viewB->setFlipH(false);
+            m_viewB->setFlipV(false);
+            m_viewB->setRot90(0);
+        }
+    });
+
+    view->addSeparator();
     auto* overscan = view->addAction(tr("Hiện vùng overscan (data window ngoài display window)"));
     overscan->setCheckable(true);
     overscan->setShortcut(QKeySequence(Qt::Key_O));
@@ -426,13 +562,13 @@ void MainWindow::buildMenus()
     connect(overscan, &QAction::toggled, this, [this](bool on) {
         QSettings().setValue("overscan", on);
         m_loader.setOverscan(on);
-        if (m_index >= 0) showIndex(m_index); // khoá cache đổi theo chế độ -> đọc lại frame hiện tại
+        if (m_index >= 0) showIndex(m_index);
     });
     view->addSeparator();
     m_compareAct = view->addAction(tr("So sánh 2 khung A | B"));
     m_compareAct->setCheckable(true);
     m_compareAct->setShortcut(QKeySequence(Qt::Key_V));
-    m_compareAct->setToolTip(tr("Chia đôi màn hình: mỗi khung chọn layer/pass và color space riêng"));
+    m_compareAct->setToolTip(tr("Chia đôi màn hình: mỗi khung chọn layer/pass, file và color space riêng"));
     connect(m_compareAct, &QAction::toggled, this, &MainWindow::setCompare);
     view->addAction(tr("So sánh kiểu Wipe (kéo đường chia)"), QKeySequence(Qt::Key_W), this, [this] { setCompareViewMode(1); });
     view->addAction(tr("So sánh kiểu Hiệu |A − B|"), QKeySequence(Qt::Key_D), this, [this] { setCompareViewMode(2); });
@@ -446,6 +582,8 @@ void MainWindow::buildMenus()
     view->addSeparator();
     view->addAction(m_infoDock->toggleViewAction());
     m_infoDock->toggleViewAction()->setShortcut(QKeySequence(Qt::Key_I));
+    view->addAction(m_histDock->toggleViewAction());
+    m_histDock->toggleViewAction()->setShortcut(QKeySequence(Qt::Key_F8));
 
     auto* color = menuBar()->addMenu(tr("&Màu"));
     color->addAction(tr("Nạp OCIO config..."), this, [this] {
@@ -479,19 +617,25 @@ void MainWindow::buildMenus()
     connect(cache, &QMenu::aboutToShow, this, [this, grp] {
         for (auto* a : grp->actions()) a->setChecked(a->data().toInt() == m_loader.budgetMB());
     });
-    cache->addAction(tr("Xoá cache"), this, [this] { m_loader.clear(); });
+    cache->addAction(tr("Xoá cache"), this, [this] {
+        m_loader.clear();
+        updateTimelineCache();
+    });
 
     auto* help = menuBar()->addMenu(tr("&Trợ giúp"));
     help->addAction(tr("Phím tắt"), this, [this] {
         QMessageBox::information(
             this, tr("Phím tắt"),
-            tr("Ctrl+O  mở file\nF  vừa khung · 1 / 2  zoom 100% / 200% · lăn chuột  zoom · kéo  pan\n"
+            tr("Ctrl+O  mở file · Ctrl+Shift+O  mở file cho khung B\n"
+               "Ctrl+S  xuất ảnh (PNG/JPG/TIFF) · Ctrl+C  chép ảnh · Ctrl+Shift+C  chép pixel\n"
+               "F  vừa khung · 1 / 2  zoom 100% / 200% · lăn chuột  zoom · kéo  pan · Shift+kéo  đo vùng\n"
                "C R G B A L  kênh RGB / R / G / B / Alpha / Luminance\n"
                "[ ]  exposure ∓½ stop · 0  reset exposure/gamma\n"
+               "T  nền caro Alpha · Shift+F  False Color · Shift+Z  Clip/NaN/Âm · Shift+G  lưới pixel\n"
+               "H / Shift+H  lật ngang/dọc · Ctrl+R / Ctrl+Shift+R  xoay 90°\n"
                "← →  frame trước/sau · Space  play/pause · Home/End  frame đầu/cuối\n"
-               "I  bảng thông tin file · F5  đọc lại file · O  hiện vùng overscan\n"
-               "V  so sánh 2 khung A | B (mỗi khung chọn pass/color space riêng) · Shift+V  chia ngang/dọc\n"
-               "W  wipe A/B (kéo đường chia, double-click về giữa) · D  hiệu |A − B| (exposure A = khuếch đại)"));
+               "I  thông tin file · F8  Histogram & Thống kê · F5  đọc lại · O  overscan\n"
+               "V  so sánh A | B · Shift+V  chia ngang/dọc · W  wipe · D  hiệu |A − B|"));
     });
     help->addAction(tr("Giới thiệu"), this, [this] {
         QMessageBox::about(this, "ExrView",
@@ -519,7 +663,7 @@ void MainWindow::loadOcioConfig(const QString& path)
 
 void MainWindow::populateColorCombos()
 {
-    m_guessCache.clear(); // config có thể đã đổi
+    m_guessCache.clear();
     m_updatingUi = true;
     QString oldInput = m_inputCombo->currentData().toString();
     QString oldDisplay = m_displayCombo->currentText();
@@ -610,18 +754,51 @@ void MainWindow::openFile(const QString& path)
     m_layerRef = LayerRef();
     m_guessCache.clear();
     m_layerSignature.clear();
-    m_layerRefB = LayerRef();
-    m_layerSignatureB.clear();
-    m_frameB.reset();
     m_frame.reset();
-    detectSequence(fi.absoluteFilePath());
+    if (m_framesB.isEmpty()) {
+        m_layerRefB = LayerRef();
+        m_layerSignatureB.clear();
+        m_frameB.reset();
+    }
+    m_inFrame = 0;
+    m_outFrame = -1;
+    m_playDir = 1;
+    detectSequence(fi.absoluteFilePath(), m_frames, m_frameNumbers, m_index);
+    m_seqBar->setVisible(m_frames.size() > 1);
+    m_updatingUi = true;
+    m_seqSlider->setRange(0, qMax(0, m_frames.size() - 1));
+    m_seqSlider->setValue(m_index);
+    m_seqSlider->setInOutRange(0, -1);
+    m_updatingUi = false;
+    updateTimelineCache();
     showIndex(m_index);
 }
 
-void MainWindow::detectSequence(const QString& path)
+void MainWindow::openFileB(const QString& path)
 {
-    m_frames.clear();
-    m_frameNumbers.clear();
+    QFileInfo fi(path);
+    if (!fi.exists()) {
+        QMessageBox::warning(this, "ExrView", tr("Không tìm thấy file B:\n%1").arg(path));
+        return;
+    }
+    QSettings().setValue("lastDir", fi.absolutePath());
+    m_layerRefB = LayerRef();
+    m_layerSignatureB.clear();
+    m_frameB.reset();
+    int dummyIdx = 0;
+    detectSequence(fi.absoluteFilePath(), m_framesB, m_frameNumbersB, dummyIdx);
+    if (!m_compare) {
+        m_bInitialized = true; // không ghi đè file B bằng copyAtoB
+        m_compareAct->setChecked(true);
+    } else {
+        showIndexB(m_index);
+    }
+}
+
+void MainWindow::detectSequence(const QString& path, QStringList& outFrames, QVector<long long>& outNumbers, int& outIndex)
+{
+    outFrames.clear();
+    outNumbers.clear();
     QFileInfo fi(path);
     std::string prefix, suffix;
     long long frame;
@@ -637,27 +814,22 @@ void MainWindow::detectSequence(const QString& path)
             int pad2;
             if (!exrv::splitFrameNumber(e.toStdString(), p2, f2, pad2, s2)) continue;
             if (QString::fromStdString(p2) != pre || QString::fromStdString(s2) != suf) continue;
-            if (pad2 != pad && QString::number(f2).size() != pad2) continue; // khác padding
+            if (pad2 != pad && QString::number(f2).size() != pad2) continue;
             found.push_back({f2, dir.absoluteFilePath(e)});
         }
         std::sort(found.begin(), found.end());
         if (found.size() > 1) {
             for (auto& p : found) {
-                m_frameNumbers.push_back(p.first);
-                m_frames.push_back(p.second);
+                outNumbers.push_back(p.first);
+                outFrames.push_back(p.second);
             }
         }
     }
-    if (m_frames.isEmpty()) {
-        m_frames << fi.absoluteFilePath();
-        m_frameNumbers << 0;
+    if (outFrames.isEmpty()) {
+        outFrames << fi.absoluteFilePath();
+        outNumbers << 0;
     }
-    m_index = std::max(0, (int)m_frames.indexOf(fi.absoluteFilePath()));
-    m_seqBar->setVisible(m_frames.size() > 1);
-    m_updatingUi = true;
-    m_seqSlider->setRange(0, m_frames.size() - 1);
-    m_seqSlider->setValue(m_index);
-    m_updatingUi = false;
+    outIndex = std::max(0, (int)outFrames.indexOf(fi.absoluteFilePath()));
 }
 
 QString MainWindow::keyForIndex(int i) const
@@ -682,7 +854,7 @@ void MainWindow::showIndex(int i)
     if (FramePtr f = m_loader.cached(k)) {
         setFrame(f);
     } else {
-        m_loader.request(m_frames[i], m_layerRef);
+        m_loader.request(m_frames[i], m_layerRef, 10); // ưu tiên cao nhất cho frame đang xem
         if (!m_frame) m_view->setMessage(tr("Đang đọc %1…").arg(QFileInfo(m_frames[i]).fileName()));
     }
     if (m_compare) showIndexB(i);
@@ -691,33 +863,52 @@ void MainWindow::showIndex(int i)
 
 void MainWindow::showIndexB(int i)
 {
-    if (!m_compare || i < 0 || i >= m_frames.size()) return;
-    QString k = m_loader.key(m_frames[i], m_layerRefB);
+    if (!m_compare) return;
+    const QStringList& srcB = m_framesB.isEmpty() ? m_frames : m_framesB;
+    if (srcB.isEmpty()) return;
+    int bi = qBound(0, i, srcB.size() - 1);
+    QString k = m_loader.key(srcB[bi], m_layerRefB);
     m_wantedKeyB = k;
     if (FramePtr f = m_loader.cached(k)) {
         setFrameB(f);
     } else {
-        m_loader.request(m_frames[i], m_layerRefB);
-        if (!m_frameB) m_viewB->setMessage(tr("Đang đọc %1…").arg(QFileInfo(m_frames[i]).fileName()));
+        m_loader.request(srcB[bi], m_layerRefB, 10);
+        if (!m_frameB) m_viewB->setMessage(tr("Đang đọc %1…").arg(QFileInfo(srcB[bi]).fileName()));
     }
 }
 
 void MainWindow::prefetchAround(int i, int ahead, int behind)
 {
     if (m_frames.size() < 2) return;
-    auto req = [this](int j) {
-        m_loader.request(m_frames[j], m_layerRef);
-        if (m_compare) m_loader.request(m_frames[j], m_layerRefB);
+    const QStringList& srcB = m_framesB.isEmpty() ? m_frames : m_framesB;
+    auto req = [this, &srcB](int j, int prio) {
+        m_loader.request(m_frames[j], m_layerRef, prio);
+        if (m_compare && !srcB.isEmpty())
+            m_loader.request(srcB[qBound(0, j, srcB.size() - 1)], m_layerRefB, prio);
     };
-    for (int k = 1; k <= ahead; ++k) req((i + k) % m_frames.size());
+    const int in = effectiveIn(), out = effectiveOut();
+    const int span = qMax(1, out - in + 1);
+    for (int k = 1; k <= ahead; ++k) {
+        int idx = in + ((i - in + k * m_playDir) % span + span) % span;
+        req(idx, 5 - k);
+    }
     for (int k = 1; k <= behind; ++k)
-        if (i - k >= 0) req(i - k);
+        if (i - k >= 0) req(i - k, -k);
+}
+
+void MainWindow::updateTimelineCache()
+{
+    if (m_frames.size() <= 1) return;
+    QVector<bool> mask(m_frames.size(), false);
+    for (int i = 0; i < m_frames.size(); ++i)
+        mask[i] = m_loader.isCached(m_loader.key(m_frames[i], m_layerRef));
+    m_seqSlider->setCachedMask(mask);
 }
 
 void MainWindow::onLoaded(const QString& key, FramePtr f)
 {
     m_cacheLabel->setText(tr("Cache %1 / %2 MB").arg(m_loader.usedMB()).arg(m_loader.budgetMB()));
-    // A và B có thể cùng chờ một khoá (cùng layer) -> xử lý cả hai, không return sớm.
+    updateTimelineCache();
     if (m_compare && key == m_wantedKeyB) {
         if (!f->error.isEmpty()) {
             m_frameB.reset();
@@ -739,12 +930,8 @@ void MainWindow::onLoaded(const QString& key, FramePtr f)
     setFrame(f);
 }
 
-// Color space "Tự động" cho một frame: theo header/tên file; layer không phải màu
-// (depth, N, P, motion...) -> role "data" (Raw) để thấy đúng giá trị.
 QString MainWindow::autoInputFor(const Frame& f, bool* dataLayer) const
 {
-    // Mọi frame của một sequence cho cùng kết quả -> nhớ lại, không hỏi OCIO mỗi frame khi play.
-    // (Cache xoá khi mở file khác hoặc đổi OCIO config.)
     const QString key = QString::fromStdString(f.csAttr) + QChar(0x1f) +
                         (f.hasChroma ? QString::fromLatin1(QByteArray((const char*)f.chroma, sizeof(f.chroma)).toHex())
                                      : QString()) +
@@ -782,14 +969,16 @@ void MainWindow::setFrame(FramePtr f)
     bool dataLayer = false;
     m_lastGuess = autoInputFor(*f, &dataLayer);
 
-    // Nhãn mục "Tự động" cho biết đang dùng color space nào.
     QString autoName = !m_lastGuess.isEmpty() ? m_lastGuess
                                               : (!m_defaultInput.isEmpty() ? m_defaultInput
                                                                            : QString::fromStdString(m_pipeline.sceneLinear()));
     m_inputCombo->setItemText(0, tr("Tự động → %1%2").arg(autoName, m_lastGuess.isEmpty() ? tr(" (mặc định)") : (dataLayer ? tr(" (layer dữ liệu)") : "")));
 
     populateLayers();
-    if (!m_playTimer.isActive()) updateInfoDock();
+    if (!m_playTimer.isActive()) {
+        updateInfoDock();
+        updateHistogram();
+    }
     m_view->setSource(f->image, !newFile && sameSize);
     render();
     const auto& P = f->info.parts[f->part];
@@ -815,7 +1004,6 @@ void MainWindow::setFrameB(FramePtr f)
                                                                             : QString::fromStdString(m_pipelineB.sceneLinear()));
     m_bInputCombo->setItemText(0, tr("Tự động → %1%2").arg(autoName, m_lastGuessB.isEmpty() ? tr(" (mặc định)") : (dataLayer ? tr(" (layer dữ liệu)") : "")));
     fillLayerCombo(m_bLayerCombo, m_layerSignatureB, *f);
-    // Khung B mới hiện hoặc đổi kích thước: theo zoom/pan của A (không để B tự fit rồi kéo A theo).
     m_syncingView = true;
     m_viewB->setSource(f->image, !newFile && sameSize);
     m_syncingView = false;
@@ -864,6 +1052,68 @@ void MainWindow::fillLayerCombo(QComboBox* combo, QString& signature, const Fram
     if (idx >= 0) combo->setCurrentIndex(idx);
 }
 
+// ---------------------------------------------------------------- Export / Clipboard
+QImage MainWindow::renderCurrentToQImage() const
+{
+    if (!m_frame || !m_frame->image || m_frame->image->empty()) return QImage();
+    std::vector<uint8_t> bgra;
+    std::string err;
+    exrv::ViewSettings vs = const_cast<MainWindow*>(this)->currentViewSettings();
+    if (!const_cast<exrv::ColorPipeline&>(m_pipeline).render(*m_frame->image, vs, bgra, &err)) {
+        return QImage();
+    }
+    QImage img((const uchar*)bgra.data(), m_frame->image->width, m_frame->image->height,
+               m_frame->image->width * 4, QImage::Format_RGB32);
+    QImage out = img.copy();
+    if (m_view->rot90() != 0) {
+        QTransform tr;
+        tr.rotate(m_view->rot90() * 90);
+        out = out.transformed(tr);
+    }
+    if (m_view->flipH() || m_view->flipV()) out = out.mirrored(m_view->flipH(), m_view->flipV());
+    return out;
+}
+
+void MainWindow::exportImage()
+{
+    if (!m_frame || !m_frame->image) return;
+    QFileInfo fi(m_frame->path);
+    QString defPath = fi.absolutePath() + "/" + fi.completeBaseName() + ".png";
+    QString outPath = QFileDialog::getSaveFileName(
+        this, tr("Xuất ảnh đã áp dụng OCIO"), defPath,
+        tr("PNG (*.png);;JPEG (*.jpg *.jpeg);;TIFF (*.tif *.tiff);;BMP (*.bmp);;WebP (*.webp)"));
+    if (outPath.isEmpty()) return;
+    QImage img = renderCurrentToQImage();
+    if (img.isNull() || !img.save(outPath)) {
+        QMessageBox::warning(this, tr("Xuất ảnh"), tr("Không ghi được file:\n%1").arg(outPath));
+        return;
+    }
+    statusBar()->showMessage(tr("Đã xuất: %1").arg(QFileInfo(outPath).fileName()), 4000);
+}
+
+void MainWindow::copyImageToClipboard()
+{
+    QImage img = renderCurrentToQImage();
+    if (img.isNull()) return;
+    QApplication::clipboard()->setImage(img);
+    statusBar()->showMessage(tr("Đã chép ảnh (%1×%2) vào Clipboard").arg(img.width()).arg(img.height()), 3000);
+}
+
+void MainWindow::copyPixelToClipboard()
+{
+    if (!m_frame || !m_frame->image || !m_hoverInside) return;
+    const auto& im = *m_frame->image;
+    if (m_hoverX < 0 || m_hoverY < 0 || m_hoverX >= im.width || m_hoverY >= im.height) return;
+    float p[4];
+    im.pixel(m_hoverX, m_hoverY, p);
+    QString txt = QString("(%1, %2) R=%3 G=%4 B=%5 A=%6")
+                      .arg(m_hoverX)
+                      .arg(m_hoverY)
+                      .arg(fmtFloat(p[0]), fmtFloat(p[1]), fmtFloat(p[2]), fmtFloat(p[3]));
+    QApplication::clipboard()->setText(txt);
+    statusBar()->showMessage(tr("Đã chép pixel: %1").arg(txt), 3000);
+}
+
 // ---------------------------------------------------------------- So sánh A | B
 void MainWindow::setCompare(bool on)
 {
@@ -880,7 +1130,7 @@ void MainWindow::setCompare(bool on)
         return;
     }
     if (!m_bInitialized) {
-        copyAtoB(); // lần đầu: B bắt đầu giống A, người dùng đổi pass/color space từ đó
+        copyAtoB();
         m_bInitialized = true;
     } else {
         showIndexB(m_index);
@@ -889,22 +1139,20 @@ void MainWindow::setCompare(bool on)
 
 void MainWindow::setCompareViewMode(int mode)
 {
-    // Bấm lại phím của chế độ đang dùng -> về cạnh nhau.
     if (m_compare && m_bModeCombo->currentIndex() == mode) mode = 0;
-    m_bModeCombo->setCurrentIndex(mode); // -> applyCompareLayout()
-    if (!m_compare) m_compareAct->setChecked(true); // -> setCompare(true)
+    m_bModeCombo->setCurrentIndex(mode);
+    if (!m_compare) m_compareAct->setChecked(true);
 }
 
 void MainWindow::applyCompareLayout()
 {
     const int mode = m_compare ? m_bModeCombo->currentIndex() : 0;
-    const bool single = m_compare && mode != 0; // Wipe / Difference: A và B chồng trên một khung
+    const bool single = m_compare && mode != 0;
     m_view->setLabel(m_compare && !single ? "A" : QString());
     m_view->setCompareMode(!m_compare || mode == 0 ? ImageView::CompareMode::Off
                            : mode == 1             ? ImageView::CompareMode::Wipe
                                                    : ImageView::CompareMode::Difference);
     if (single) {
-        // Chỉ giữ thanh điều khiển của B (dải mỏng dưới khung A).
         m_viewB->hide();
         m_bPanel->setMaximumHeight(m_bBar->sizeHint().height());
         m_splitter->setOrientation(Qt::Vertical);
@@ -916,7 +1164,6 @@ void MainWindow::applyCompareLayout()
         m_splitter->setOrientation(
             (Qt::Orientation)QSettings().value("compareOrientation", (int)Qt::Horizontal).toInt());
         if (m_compare) {
-            // Hai khung bằng nhau; pipeline B vừa phục vụ lớp B của khung A -> dựng lại shader khung B.
             int total = m_splitter->orientation() == Qt::Horizontal ? m_splitter->width() : m_splitter->height();
             m_splitter->setSizes({total / 2, total - total / 2});
             m_viewB->colorConfigChanged();
@@ -933,6 +1180,8 @@ void MainWindow::applyCompareLayout()
 
 void MainWindow::copyAtoB()
 {
+    m_framesB.clear();
+    m_frameNumbersB.clear();
     m_updatingUi = true;
     m_bChannelCombo->setCurrentIndex(m_channelCombo->currentIndex());
     int ii = m_bInputCombo->findData(m_inputCombo->currentData());
@@ -948,7 +1197,6 @@ void MainWindow::copyAtoB()
     m_updatingUi = false;
     m_layerRefB = m_layerRef;
     if (m_frame && m_layerRefB.part < 0) {
-        // A đang ở layer mặc định -> ghi rõ để B giữ nguyên khi A đổi layer sau này.
         m_layerRefB.part = m_frame->part;
         m_layerRefB.partName = QString::fromStdString(m_frame->info.parts[m_frame->part].name);
         m_layerRefB.layerName = QString::fromStdString(m_frame->info.parts[m_frame->part].layers[m_frame->layer].name);
@@ -959,7 +1207,6 @@ void MainWindow::copyAtoB()
     }
 }
 
-// Nạp config cho pipeline B lần đầu cần tới (bật so sánh) — không làm lúc khởi động.
 void MainWindow::ensurePipelineB()
 {
     if (m_bPipelineReady) return;
@@ -971,7 +1218,6 @@ void MainWindow::ensurePipelineB()
 void MainWindow::syncPipelineB()
 {
     if (!m_bPipelineReady) return;
-    // Cùng config với A (đường dẫn rỗng = config mặc định: $OCIO hoặc ACES dựng sẵn).
     std::string err;
     if (!m_pipelineB.loadConfig(m_pipeline.configPath(), &err)) m_pipelineB.loadConfig("", &err);
     if (m_viewB) m_viewB->colorConfigChanged();
@@ -1037,7 +1283,7 @@ exrv::ViewSettings MainWindow::viewSettingsB()
     vs.display = m_bDisplayCombo->currentText().toStdString();
     vs.view = m_bViewCombo->currentText().toStdString();
     vs.exposure = (float)m_bExpSpin->value();
-    vs.gamma = (float)m_gammaSpin->value(); // gamma dùng chung
+    vs.gamma = (float)m_gammaSpin->value();
     vs.channel = (exrv::ChannelMode)m_bChannelCombo->currentIndex();
     return vs;
 }
@@ -1047,7 +1293,7 @@ void MainWindow::renderB()
     if (!m_compare || m_updatingUi) return;
     const exrv::ViewSettings vs = viewSettingsB();
     m_viewB->setViewSettings(vs);
-    m_view->setSecondViewSettings(vs); // lớp B của Wipe
+    m_view->setSecondViewSettings(vs);
     if (m_hoverInside) updateHover(m_hoverX, m_hoverY, true);
 }
 
@@ -1092,18 +1338,28 @@ void MainWindow::updateInfoDock()
     }
 }
 
+void MainWindow::updateHistogram()
+{
+    if (!m_histDock || !m_histDock->isVisible()) return;
+    if (!m_frame || !m_frame->image) {
+        m_histDock->clear();
+        return;
+    }
+    m_histDock->setImage(m_frame->image, (float)m_expSpin->value());
+}
+
 void MainWindow::render()
 {
     if (m_updatingUi) return;
     m_view->setViewSettings(currentViewSettings());
     if (m_compare) {
-        const exrv::ViewSettings vsB = viewSettingsB(); // gamma dùng chung
+        const exrv::ViewSettings vsB = viewSettingsB();
         m_viewB->setViewSettings(vsB);
         m_view->setSecondViewSettings(vsB);
     }
     if (m_hoverInside) updateHover(m_hoverX, m_hoverY, true);
+    if (!m_playTimer.isActive()) updateHistogram();
     if (m_infoDock->isVisible() && !m_playTimer.isActive()) {
-        // cập nhật dòng "Input color space" trong bảng thông tin
         auto items = m_infoTree->findItems(tr("Input color space"), Qt::MatchExactly | Qt::MatchRecursive);
         for (auto* it : items) it->setText(1, resolvedInput());
     }
@@ -1114,7 +1370,6 @@ void MainWindow::updateHover(int x, int y, bool inside)
     m_hoverX = x;
     m_hoverY = y;
     m_hoverInside = inside;
-    // Giá trị gốc + giá trị hiển thị (chạy đúng 1 pixel qua OCIO trên CPU với cùng cài đặt).
     auto sample = [x, y](const FramePtr& f, exrv::ColorPipeline& pipe, const exrv::ViewSettings& vs,
                          QString& coords) -> QString {
         if (!f || !f->image) return QString();
@@ -1156,6 +1411,53 @@ void MainWindow::updateHover(int x, int y, bool inside)
                           (b.isEmpty() ? QStringLiteral("—") : b));
 }
 
+void MainWindow::onRegionSelected(const QRect& r)
+{
+    if (!m_frame || !m_frame->image || r.isEmpty()) return;
+    const auto& im = *m_frame->image;
+    int x0 = qBound(0, r.left(), im.width - 1);
+    int y0 = qBound(0, r.top(), im.height - 1);
+    int x1 = qBound(x0, r.right(), im.width - 1);
+    int y1 = qBound(y0, r.bottom(), im.height - 1);
+
+    double sum[4] = {0, 0, 0, 0};
+    float mn[3] = {std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity(),
+                   std::numeric_limits<float>::infinity()};
+    float mx[3] = {-std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(),
+                   -std::numeric_limits<float>::infinity()};
+    size_t count = 0;
+    float p[4];
+    for (int y = y0; y <= y1; ++y) {
+        for (int x = x0; x <= x1; ++x) {
+            im.pixel(x, y, p);
+            if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) continue;
+            for (int c = 0; c < 4; ++c) sum[c] += p[c];
+            for (int c = 0; c < 3; ++c) {
+                mn[c] = std::min(mn[c], p[c]);
+                mx[c] = std::max(mx[c], p[c]);
+            }
+            ++count;
+        }
+    }
+    if (count == 0) return;
+    const double inv = 1.0 / (double)count;
+    m_pixelLabel->setText(
+        tr("Vùng %1×%2 (%3 px)   Mean: R %4  G %5  B %6  A %7   |   Min: %8 %9 %10   Max: %11 %12 %13")
+            .arg(x1 - x0 + 1)
+            .arg(y1 - y0 + 1)
+            .arg(count)
+            .arg(sum[0] * inv, 0, 'f', 4)
+            .arg(sum[1] * inv, 0, 'f', 4)
+            .arg(sum[2] * inv, 0, 'f', 4)
+            .arg(sum[3] * inv, 0, 'f', 3)
+            .arg(mn[0], 0, 'f', 3)
+            .arg(mn[1], 0, 'f', 3)
+            .arg(mn[2], 0, 'f', 3)
+            .arg(mx[0], 0, 'f', 3)
+            .arg(mx[1], 0, 'f', 3)
+            .arg(mx[2], 0, 'f', 3));
+}
+
 void MainWindow::updateTitle()
 {
     if (!m_frame) {
@@ -1166,15 +1468,42 @@ void MainWindow::updateTitle()
 }
 
 // ---------------------------------------------------------------- Play
+int MainWindow::effectiveIn() const
+{
+    return qBound(0, m_inFrame, qMax(0, m_frames.size() - 1));
+}
+
+int MainWindow::effectiveOut() const
+{
+    if (m_frames.isEmpty()) return 0;
+    return (m_outFrame < 0) ? (m_frames.size() - 1) : qBound(effectiveIn(), m_outFrame, m_frames.size() - 1);
+}
+
+void MainWindow::cycleLoopMode()
+{
+    int m = ((int)m_loopMode + 1) % 3;
+    m_loopMode = (LoopMode)m;
+    if (m_loopMode == LoopMode::Loop) {
+        m_loopBtn->setText("🔁");
+        m_playDir = 1;
+    } else if (m_loopMode == LoopMode::PingPong) {
+        m_loopBtn->setText("⇄");
+    } else {
+        m_loopBtn->setText("→|");
+        m_playDir = 1;
+    }
+}
+
 void MainWindow::togglePlay()
 {
     if (m_frames.size() < 2) return;
     if (m_playTimer.isActive()) {
         m_playTimer.stop();
         m_playBtn->setText("▶");
-        m_view->setPlayback(false); // tạo lại mipmap cho frame đang dừng
+        m_view->setPlayback(false);
         m_viewB->setPlayback(false);
         updateInfoDock();
+        updateHistogram();
         m_frameLabel->setToolTip(QString());
         return;
     }
@@ -1183,8 +1512,6 @@ void MainWindow::togglePlay()
     m_fpsFrames = 0;
     m_view->setPlayback(true);
     m_viewB->setPlayback(true);
-    // Timer chạy dày hơn chu kỳ frame; tick() tự so đồng hồ để đổi frame đúng lúc
-    // (FPS trung bình chính xác, frame vừa đọc xong được hiện ngay thay vì chờ thêm một chu kỳ).
     m_playClock.restart();
     m_nextDueNs = 0;
     m_playTimer.start(playTickMs());
@@ -1200,15 +1527,40 @@ void MainWindow::tick()
 {
     if (m_frames.size() < 2) return;
     const qint64 now = m_playClock.nsecsElapsed();
-    if (now < m_nextDueNs) return; // chưa tới giờ của frame kế
-    int next = (m_index + 1) % m_frames.size();
-    prefetchAround(m_index, 8, 0);
-    if (!m_loader.cached(keyForIndex(next))) return; // chờ frame đọc xong — không nhảy cóc
-    if (m_compare && !m_loader.cached(m_loader.key(m_frames[next], m_layerRefB))) return;
+    if (now < m_nextDueNs) return;
+
+    const int in = effectiveIn();
+    const int out = effectiveOut();
+    int next = m_index + m_playDir;
+    if (m_loopMode == LoopMode::Loop) {
+        if (next > out) next = in;
+        else if (next < in) next = out;
+    } else if (m_loopMode == LoopMode::PingPong) {
+        if (next > out) {
+            m_playDir = -1;
+            next = qMax(in, out - 1);
+        } else if (next < in) {
+            m_playDir = 1;
+            next = qMin(out, in + 1);
+        }
+    } else {
+        if (next > out) {
+            togglePlay();
+            return;
+        }
+    }
+
+    if (!m_loader.cached(keyForIndex(next))) return;
+    if (m_compare) {
+        const QStringList& srcB = m_framesB.isEmpty() ? m_frames : m_framesB;
+        int bi = qBound(0, next, srcB.size() - 1);
+        if (!m_loader.cached(m_loader.key(srcB[bi], m_layerRefB))) return;
+    }
     showIndex(next);
+    prefetchAround(next, 8, 0);
     const qint64 period = (qint64)(1e9 / m_fpsSpin->value());
     m_nextDueNs += period;
-    if (m_nextDueNs + period < now) m_nextDueNs = now + period; // đã trễ nhiều (chờ đọc file): không chạy dồn frame
+    if (m_nextDueNs + period < now) m_nextDueNs = now + period;
     ++m_fpsFrames;
     if (m_fpsClock.elapsed() > 1000) {
         m_actualFps = m_fpsFrames * 1000.0 / m_fpsClock.elapsed();
@@ -1232,8 +1584,8 @@ void MainWindow::keyPressEvent(QKeyEvent* e)
     case Qt::Key_Left: stepFrame(-1); return;
     case Qt::Key_Right: stepFrame(1); return;
     case Qt::Key_Space: togglePlay(); return;
-    case Qt::Key_Home: showIndex(0); return;
-    case Qt::Key_End: showIndex(m_frames.size() - 1); return;
+    case Qt::Key_Home: showIndex(effectiveIn()); return;
+    case Qt::Key_End: showIndex(effectiveOut()); return;
     default: QMainWindow::keyPressEvent(e);
     }
 }
@@ -1246,7 +1598,6 @@ void MainWindow::applyToExplorerPreview()
 #else
     QSettings reg("ExrView", "Preview");
 #endif
-    // Lưu dạng chuỗi để shell extension đọc trực tiếp bằng RegGetValueW.
     reg.setValue("OcioConfig", QString::fromStdString(m_pipeline.configPath()));
     reg.setValue("Display", m_displayCombo->currentText());
     reg.setValue("View", m_viewCombo->currentText());
@@ -1318,6 +1669,7 @@ void MainWindow::loadSettings()
     m_gammaSpin->setValue(s.value("gamma", 1.0).toDouble());
     m_fpsSpin->setValue(s.value("fps", 24.0).toDouble());
     m_loader.setBudgetMB(s.value("cacheMB", 2048).toInt());
+    m_bgCombo->setCurrentIndex(s.value("bgMode", 0).toInt());
     m_updatingUi = false;
     restoreGeometry(s.value("geometry").toByteArray());
     restoreState(s.value("windowState").toByteArray());
@@ -1333,6 +1685,7 @@ void MainWindow::saveSettings()
     s.setValue("gamma", m_gammaSpin->value());
     s.setValue("fps", m_fpsSpin->value());
     s.setValue("cacheMB", m_loader.budgetMB());
+    s.setValue("bgMode", m_bgCombo->currentIndex());
     s.setValue("geometry", saveGeometry());
     s.setValue("windowState", saveState());
 }

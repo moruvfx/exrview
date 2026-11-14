@@ -5,25 +5,28 @@
 
 #include <QElapsedTimer>
 #include <QHash>
-#include <QPair>
+#include <QImage>
 #include <QMainWindow>
+#include <QPair>
 #include <QStringList>
 #include <QTimer>
 #include <QVector>
 
+class HistogramDock;
 class ImageView;
+class TimelineSlider;
+class QAction;
 class QComboBox;
+class QDockWidget;
 class QDoubleSpinBox;
 class QLabel;
+class QMenu;
 class QSlider;
 class QSpinBox;
+class QSplitter;
 class QToolButton;
 class QTreeWidget;
-class QDockWidget;
-class QMenu;
 class QWidget;
-class QSplitter;
-class QAction;
 struct Frame;
 
 class MainWindow : public QMainWindow {
@@ -33,12 +36,15 @@ public:
     ~MainWindow() override;
 
     void openFile(const QString& path);
+    void openFileB(const QString& path);
 
 protected:
     void closeEvent(QCloseEvent*) override;
     void keyPressEvent(QKeyEvent*) override;
 
 private:
+    enum class LoopMode { Loop = 0, PingPong, Once };
+
     // UI
     void buildUi();
     void buildMenus();
@@ -53,21 +59,30 @@ private:
     QString resolvedInput() const;
 
     // Frame
-    void detectSequence(const QString& path);
+    void detectSequence(const QString& path, QStringList& outFrames, QVector<long long>& outNumbers, int& outIndex);
     QString keyForIndex(int i) const;
     void showIndex(int i);
     void setFrame(FramePtr f);
     void onLoaded(const QString& key, FramePtr f);
     void prefetchAround(int i, int ahead, int behind);
+    void updateTimelineCache();
     void populateLayers();
     void updateInfoDock();
+    void updateHistogram();
     void render();
     void updateHover(int x, int y, bool inside);
+    void onRegionSelected(const QRect& r);
     void updateTitle();
     QString autoInputFor(const Frame& f, bool* dataLayer) const;
     void fillLayerCombo(QComboBox* combo, QString& signature, const Frame& f);
 
-    // So sánh A | B: khung B có layer/pass và cài đặt màu riêng, zoom/pan đồng bộ với A
+    // Export / Clipboard
+    QImage renderCurrentToQImage() const;
+    void exportImage();
+    void copyImageToClipboard();
+    void copyPixelToClipboard();
+
+    // So sánh A | B: khung B có thể xem layer khác của A hoặc mở file/sequence riêng
     void setCompare(bool on);
     void copyAtoB();
     void showIndexB(int i);
@@ -79,14 +94,17 @@ private:
     QString resolvedInputB() const;
     exrv::ViewSettings viewSettingsB();
     void renderB();
-    void applyCompareLayout();           // bố trí theo chế độ: cạnh nhau / wipe / difference
-    void setCompareViewMode(int mode);   // 0 cạnh nhau, 1 wipe, 2 difference (bật so sánh nếu đang tắt)
+    void applyCompareLayout();
+    void setCompareViewMode(int mode);
 
     // Sequence
     void togglePlay();
     void tick();
     void stepFrame(int d);
     int playTickMs() const;
+    int effectiveIn() const;
+    int effectiveOut() const;
+    void cycleLoopMode();
 
     // Khác
     void applyToExplorerPreview();
@@ -106,6 +124,8 @@ private:
     QComboBox* m_inputCombo = nullptr;
     QComboBox* m_displayCombo = nullptr;
     QComboBox* m_viewCombo = nullptr;
+    QComboBox* m_bgCombo = nullptr;
+    QComboBox* m_inspectCombo = nullptr;
     QSlider* m_expSlider = nullptr;
     QDoubleSpinBox* m_expSpin = nullptr;
     QDoubleSpinBox* m_gammaSpin = nullptr;
@@ -116,28 +136,34 @@ private:
     QLabel* m_infoLabel = nullptr;
     QTreeWidget* m_infoTree = nullptr;
     QDockWidget* m_infoDock = nullptr;
+    HistogramDock* m_histDock = nullptr;
     QMenu* m_recentMenu = nullptr;
 
     QWidget* m_seqBar = nullptr;
-    QSlider* m_seqSlider = nullptr;
+    TimelineSlider* m_seqSlider = nullptr;
     QLabel* m_frameLabel = nullptr;
     QToolButton* m_playBtn = nullptr;
+    QToolButton* m_loopBtn = nullptr;
     QDoubleSpinBox* m_fpsSpin = nullptr;
     QLabel* m_cacheLabel = nullptr;
 
     QStringList m_frames;
     QVector<long long> m_frameNumbers;
     int m_index = -1;
+    int m_inFrame = 0;
+    int m_outFrame = -1;
+    LoopMode m_loopMode = LoopMode::Loop;
+    int m_playDir = 1;
     LayerRef m_layerRef;
     FramePtr m_frame;
     QString m_wantedKey;
-    QString m_defaultInput; // dùng khi không đoán được color space
+    QString m_defaultInput;
     QString m_layerSignature;
     QString m_lastGuess;
 
     QTimer m_playTimer;
     QElapsedTimer m_fpsClock;
-    QElapsedTimer m_playClock; // đồng hồ đổi frame khi play
+    QElapsedTimer m_playClock;
     qint64 m_nextDueNs = 0;
     int m_fpsFrames = 0;
     double m_actualFps = 0;
@@ -146,11 +172,9 @@ private:
     bool m_hoverInside = false;
 
     // So sánh A | B
-    // Riêng cho B: shader GPU/processor CPU của mỗi khung độc lập. Chỉ nạp config khi bật so sánh
-    // lần đầu (không làm chậm khởi động).
     exrv::ColorPipeline m_pipelineB{false};
     bool m_bPipelineReady = false;
-    mutable QHash<QString, QPair<QString, bool>> m_guessCache; // color space "Tự động" theo header/layer của sequence đang mở
+    mutable QHash<QString, QPair<QString, bool>> m_guessCache;
     QSplitter* m_splitter = nullptr;
     QWidget* m_bPanel = nullptr;
     ImageView* m_viewB = nullptr;
@@ -165,6 +189,8 @@ private:
     QDoubleSpinBox* m_bExpSpin = nullptr;
     bool m_compare = false;
     bool m_bInitialized = false;
+    QStringList m_framesB; // rỗng = dùng chung sequence với A
+    QVector<long long> m_frameNumbersB;
     LayerRef m_layerRefB;
     FramePtr m_frameB;
     QString m_wantedKeyB;

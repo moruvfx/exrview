@@ -14,6 +14,7 @@ FrameLoader::FrameLoader(QObject* parent) : QObject(parent)
 
 FrameLoader::~FrameLoader()
 {
+    m_gen.fetch_add(1, std::memory_order_relaxed);
     m_pool.clear();
     m_pool.waitForDone();
 }
@@ -30,22 +31,32 @@ FramePtr FrameLoader::cached(const QString& k) const
     return p ? *p : FramePtr();
 }
 
-void FrameLoader::request(const QString& path, const LayerRef& ref)
+void FrameLoader::request(const QString& path, const LayerRef& ref, int priority)
 {
     QString k = key(path, ref);
     if (m_pending.contains(k) || m_cache.contains(k)) return;
     m_pending.insert(k);
     QPointer<FrameLoader> self(this);
     const bool overscan = m_overscan;
-    m_pool.start([self, k, path, ref, overscan] {
-        FramePtr f = FrameLoader::load(path, ref, overscan);
-        if (!self) return;
-        QMetaObject::invokeMethod(self.data(), [self, k, f] { if (self) self->finished(k, f); }, Qt::QueuedConnection);
-    });
+    const uint64_t gen = m_gen.load(std::memory_order_relaxed);
+    m_pool.start(
+        [self, gen, k, path, ref, overscan] {
+            if (!self || self->m_gen.load(std::memory_order_relaxed) != gen) return;
+            FramePtr f = FrameLoader::load(path, ref, overscan);
+            if (!self) return;
+            QMetaObject::invokeMethod(
+                self.data(),
+                [self, gen, k, f] {
+                    if (self) self->finished(gen, k, f);
+                },
+                Qt::QueuedConnection);
+        },
+        priority);
 }
 
-void FrameLoader::finished(const QString& k, FramePtr f)
+void FrameLoader::finished(uint64_t gen, const QString& k, FramePtr f)
 {
+    if (gen != m_gen.load(std::memory_order_relaxed)) return;
     m_pending.remove(k);
     if (f && f->error.isEmpty()) {
         int cost = (int)qMax<size_t>(1, f->bytes() >> 20);
@@ -56,7 +67,9 @@ void FrameLoader::finished(const QString& k, FramePtr f)
 
 void FrameLoader::clear()
 {
+    m_gen.fetch_add(1, std::memory_order_relaxed);
     m_pool.clear();
+    m_pending.clear();
     m_cache.clear();
 }
 

@@ -7,6 +7,8 @@ set(SOURCES
     MainWindow.cpp MainWindow.h
     ImageView.cpp ImageView.h
     FrameLoader.cpp FrameLoader.h
+    HistogramDock.cpp HistogramDock.h
+    TimelineSlider.h
     resources/resources.qrc)
 if(WIN32)
     list(APPEND SOURCES resources/app.rc)

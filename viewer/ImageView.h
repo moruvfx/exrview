@@ -1,16 +1,18 @@
 // ImageView — vùng hiển thị ảnh bằng OpenGL: OCIO chạy trên GPU (shader), exposure/gamma/kênh
 // đổi tức thì. Tự chuyển sang render CPU nếu máy không có OpenGL 3.3 hoặc ảnh vượt giới hạn texture.
-// Zoom quanh con trỏ, kéo để pan, double-click để fit.
+// Zoom quanh con trỏ, kéo để pan, double-click để fit, Shift+kéo để đo vùng pixel.
 // Chế độ so sánh trong cùng một khung: Wipe (A bên trái, B bên phải đường chia kéo được)
 // và Difference (|A − B| × 2^exposure, giá trị tuyến tính không qua OCIO).
 #pragma once
 
 #include "exrcore.h"
 
+#include <QHash>
 #include <QImage>
 #include <QOpenGLExtraFunctions>
 #include <QOpenGLWidget>
 #include <QPointF>
+#include <QRect>
 
 #include <memory>
 
@@ -20,6 +22,8 @@ class ImageView : public QOpenGLWidget, protected QOpenGLExtraFunctions {
     Q_OBJECT
 public:
     enum class CompareMode { Off = 0, Wipe, Difference };
+    enum class BgMode { Dark = 0, Black, Gray, Checker };
+    enum class InspectMode { Normal = 0, FalseColor, Clipping };
 
     explicit ImageView(exrv::ColorPipeline* pipeline, QWidget* parent = nullptr);
     ~ImageView() override;
@@ -38,6 +42,20 @@ public:
     void setSecondViewSettings(const exrv::ViewSettings& vs);
     void secondColorConfigChanged();
 
+    // Hiển thị & kiểm tra ảnh chuyên nghiệp
+    void setBgMode(BgMode m);
+    BgMode bgMode() const { return m_bgMode; }
+    void setInspectMode(InspectMode m);
+    InspectMode inspectMode() const { return m_inspectMode; }
+    void setPixelGrid(bool on);
+    bool pixelGrid() const { return m_pixelGrid; }
+    void setFlipH(bool on);
+    bool flipH() const { return m_flipH; }
+    void setFlipV(bool on);
+    bool flipV() const { return m_flipV; }
+    void setRot90(int steps); // 0, 1, 2, 3 (chiều kim đồng hồ)
+    int rot90() const { return m_rot90; }
+
     void fit();
     void setZoom(double z, QPointF anchorWidget = QPointF(-1, -1));
     double zoom() const { return m_zoom; }
@@ -52,7 +70,8 @@ public:
     void setPlayback(bool on);            // đang play sequence: ưu tiên tốc độ (không tạo mipmap mỗi frame)
 
 signals:
-    void hovered(int x, int y, bool inside); // toạ độ pixel ảnh
+    void hovered(int x, int y, bool inside); // toạ độ pixel ảnh gốc (đã tính flip/rotate)
+    void regionSelected(const QRect& imageRect);
     void zoomChanged(double zoom);
     void fileDropped(const QString& path);
     void rendererChanged(const QString& info);
@@ -82,7 +101,11 @@ private:
         bool texDirty = false;
         bool cpuDirty = true;
         QOpenGLShaderProgram* prog = nullptr;
+        QHash<QByteArray, GLint> uniformLocs;
         unsigned tex = 0;
+        unsigned pbo[2] = {0, 0};
+        size_t pboBytes[2] = {0, 0};
+        int pboIdx = 0;
         int texW = 0, texH = 0;   // kích thước/kiểu texture đang cấp phát (để ghi đè thay vì cấp lại)
         bool texHalf = false;
         bool mipsValid = false;
@@ -91,9 +114,10 @@ private:
         bool valid() const { return src && !src->empty(); }
     };
 
-    QPointF widgetToImage(QPointF p) const;
+    QPointF widgetToSourceImage(QPointF p) const; // toạ độ trên ảnh gốc (đã đảo flip/rotate)
+    QPointF displayToSource(QPointF dp) const;
     void emitHover(QPointF widgetPos);
-    QSize imageSize() const;
+    QSize imageSize() const; // kích thước hiển thị (sau khi tính rot90)
     bool twoLayers() const { return m_mode != CompareMode::Off && m_layers[1].valid(); }
     bool rebuildShader(Layer& L, QString* err);
     bool buildDiffShader(QString* err);
@@ -113,9 +137,19 @@ private:
 
     Layer m_layers[2];
     CompareMode m_mode = CompareMode::Off;
+    BgMode m_bgMode = BgMode::Dark;
+    InspectMode m_inspectMode = InspectMode::Normal;
+    bool m_pixelGrid = true;
+    bool m_flipH = false;
+    bool m_flipV = false;
+    int m_rot90 = 0;
     double m_wipe = 0.5; // vị trí đường wipe theo tỉ lệ bề ngang khung
     bool m_draggingWipe = false;
     bool m_playback = false;
+
+    // Chọn vùng (Shift + kéo)
+    bool m_selecting = false;
+    QPointF m_selStart, m_selEnd;
 
     // GL
     bool m_glOk = false;
