@@ -39,14 +39,45 @@ struct FileInfo {
     std::vector<Part> parts;
 };
 
-// Ảnh float RGBA (theo display window), alpha = 1 nếu không có.
+// Ảnh RGBA (theo display window, hoặc display ∪ data window khi bật overscan), alpha = 1 nếu không có.
+// Lưu dạng half 16-bit khi mọi channel nguồn đều là HALF (không mất dữ liệu, tốn nửa RAM),
+// ngược lại lưu float 32-bit (giữ nguyên depth/position lớn hơn 65504).
 struct Image {
     int width = 0, height = 0;
     int sourceChannels = 0; // số channel thật sự đọc được (1..4)
     bool hasAlpha = false;
-    std::vector<float> rgba;
+    // Vị trí display window bên trong ảnh (pixel ảnh). Không bật overscan: 0, 0, width, height.
+    int dispX = 0, dispY = 0, dispW = 0, dispH = 0;
+    std::vector<float> rgba;        // dùng khi !isHalf()
+    std::vector<uint16_t> rgbaHalf; // bit IEEE half, dùng khi isHalf()
+
     bool empty() const { return width <= 0 || height <= 0; }
-    size_t bytes() const { return rgba.size() * sizeof(float); }
+    bool isHalf() const { return !rgbaHalf.empty(); }
+    size_t bytes() const { return rgba.size() * sizeof(float) + rgbaHalf.size() * sizeof(uint16_t); }
+    bool hasOverscan() const { return dispX != 0 || dispY != 0 || dispW != width || dispH != height; }
+    // Đọc 1 pixel dạng float (x, y trong ảnh, phải hợp lệ).
+    void pixel(int x, int y, float out[4]) const;
+    // Toàn bộ ảnh dạng float RGBA.
+    void toFloat(std::vector<float>& out) const;
+};
+
+float halfToFloat(uint16_t h);
+
+struct ReadOptions {
+    int maxSize = 0;         // > 0: thu nhỏ (box filter, dùng mipmap nếu có) để vừa trong maxSize x maxSize
+    bool overscan = false;   // true: ảnh = display ∪ data window (thấy cả vùng overscan)
+    bool allowHalf = true;   // cho phép lưu half khi file là half
+};
+
+// Nguồn dữ liệu tuần tự có seek (shell extension bọc IStream của Windows) —
+// đọc thẳng từ file, không phải chép cả file vào RAM.
+class InputStream {
+public:
+    virtual ~InputStream() = default;
+    virtual bool read(char* dst, uint64_t n) = 0; // false = lỗi / hết file
+    virtual bool seek(uint64_t pos) = 0;
+    virtual uint64_t tell() const = 0;
+    virtual uint64_t size() const = 0;
 };
 
 class ExrFile {
@@ -55,12 +86,16 @@ public:
     static std::unique_ptr<ExrFile> openPath(const std::string& utf8Path, std::string* err);
     // Dữ liệu trong bộ nhớ (dùng cho shell extension đọc từ IStream).
     static std::unique_ptr<ExrFile> openMemory(std::vector<char> data, std::string* err);
+    // Đọc qua InputStream. threads = 0: mọi thao tác đọc/giải nén chạy trên thread gọi
+    // (bắt buộc với IStream COM chỉ được gọi từ apartment của nó).
+    static std::unique_ptr<ExrFile> openStream(std::unique_ptr<InputStream> stream, std::string* err, int threads = 0);
     ~ExrFile();
 
     const FileInfo& info() const;
 
     // Đọc một layer. maxSize > 0: thu nhỏ (box filter) để vừa trong maxSize x maxSize.
     bool readLayer(int part, int layer, Image& out, std::string* err, int maxSize = 0) const;
+    bool readLayer(int part, int layer, Image& out, std::string* err, const ReadOptions& opt) const;
 
     // Layer mặc định nên hiển thị (RGBA của part đầu tiên nếu có).
     void defaultLayer(int& part, int& layer) const;

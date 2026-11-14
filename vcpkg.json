@@ -2,6 +2,7 @@
   "name": "exrview",
   "version-string": "1.0.0",
   "description": "Trình xem OpenEXR với OpenColorIO + thumbnail/preview cho Windows Explorer",
+  "builtin-baseline": "9eec002df1cd109f8f104cd966a763daf9751489",
   "dependencies": [
     "openexr",
     "opencolorio"

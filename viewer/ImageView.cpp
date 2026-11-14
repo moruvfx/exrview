@@ -248,8 +248,14 @@ void ImageView::uploadImage()
     if (!m_imgTex) glGenTextures(1, &m_imgTex);
     glBindTexture(GL_TEXTURE_2D, m_imgTex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    // RGBA32F: giữ nguyên giá trị lớn (depth, position) — RGBA16F sẽ tràn thành Inf > 65504.
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, m_src->width, m_src->height, 0, GL_RGBA, GL_FLOAT, m_src->rgba.data());
+    if (m_src->isHalf()) {
+        // File gốc là half -> RGBA16F không mất gì, nửa bộ nhớ GPU.
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, m_src->width, m_src->height, 0, GL_RGBA, GL_HALF_FLOAT,
+                     m_src->rgbaHalf.data());
+    } else {
+        // RGBA32F: giữ nguyên giá trị lớn (depth, position) — RGBA16F sẽ tràn thành Inf > 65504.
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, m_src->width, m_src->height, 0, GL_RGBA, GL_FLOAT, m_src->rgba.data());
+    }
     glGenerateMipmap(GL_TEXTURE_2D);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
@@ -388,6 +394,14 @@ void ImageView::drawOverlay()
     p.setPen(QPen(QColor(90, 90, 95), 1, Qt::DashLine));
     p.setBrush(Qt::NoBrush);
     p.drawRect(target.adjusted(-0.5, -0.5, 0.5, 0.5));
+    if (m_src->hasOverscan()) {
+        // Khung display window khi đang xem cả vùng overscan.
+        QRectF disp(m_offset + QPointF(m_src->dispX, m_src->dispY) * m_zoom,
+                    QSizeF(m_src->dispW * m_zoom, m_src->dispH * m_zoom));
+        p.setPen(QPen(QColor(255, 200, 60), 1, Qt::SolidLine));
+        p.drawRect(disp.adjusted(-0.5, -0.5, 0.5, 0.5));
+        p.drawText(disp.topLeft() + QPointF(4, -4), tr("display window"));
+    }
     if (!m_message.isEmpty()) {
         p.setPen(QColor(255, 180, 80));
         p.drawText(rect().adjusted(10, 10, -10, -10), Qt::AlignTop | Qt::AlignLeft, m_message);

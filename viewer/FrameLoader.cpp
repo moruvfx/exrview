@@ -18,9 +18,10 @@ FrameLoader::~FrameLoader()
     m_pool.waitForDone();
 }
 
-QString FrameLoader::key(const QString& path, const LayerRef& ref)
+QString FrameLoader::key(const QString& path, const LayerRef& ref) const
 {
-    return path + QChar(0x1f) + QString::number(ref.part) + QChar(0x1f) + ref.partName + QChar(0x1f) + ref.layerName;
+    return path + QChar(0x1f) + QString::number(ref.part) + QChar(0x1f) + ref.partName + QChar(0x1f) + ref.layerName +
+           (m_overscan ? QString(QChar(0x1f)) + QStringLiteral("overscan") : QString());
 }
 
 FramePtr FrameLoader::cached(const QString& k) const
@@ -35,8 +36,9 @@ void FrameLoader::request(const QString& path, const LayerRef& ref)
     if (m_pending.contains(k) || m_cache.contains(k)) return;
     m_pending.insert(k);
     QPointer<FrameLoader> self(this);
-    m_pool.start([self, k, path, ref] {
-        FramePtr f = FrameLoader::load(path, ref);
+    const bool overscan = m_overscan;
+    m_pool.start([self, k, path, ref, overscan] {
+        FramePtr f = FrameLoader::load(path, ref, overscan);
         if (!self) return;
         QMetaObject::invokeMethod(self.data(), [self, k, f] { if (self) self->finished(k, f); }, Qt::QueuedConnection);
     });
@@ -58,7 +60,7 @@ void FrameLoader::clear()
     m_cache.clear();
 }
 
-FramePtr FrameLoader::load(const QString& path, const LayerRef& ref)
+FramePtr FrameLoader::load(const QString& path, const LayerRef& ref, bool overscan)
 {
     auto f = std::make_shared<Frame>();
     f->path = path;
@@ -95,7 +97,9 @@ FramePtr FrameLoader::load(const QString& path, const LayerRef& ref)
 
     auto img = std::make_shared<exrv::Image>();
     err.clear();
-    if (!file->readLayer(part, layer, *img, &err)) {
+    exrv::ReadOptions opt;
+    opt.overscan = overscan;
+    if (!file->readLayer(part, layer, *img, &err, opt)) {
         f->error = QString::fromStdString(err);
         return f;
     }

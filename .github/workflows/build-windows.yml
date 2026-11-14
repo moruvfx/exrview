@@ -32,6 +32,18 @@ jobs:
           arch: win64_msvc2022_64
           cache: true
 
+      # vcpkg ở đúng commit "builtin-baseline" trong vcpkg.json -> mọi lần build dùng cùng
+      # phiên bản OpenEXR/OCIO, không phụ thuộc bản vcpkg cài sẵn trên runner.
+      - name: vcpkg (pinned)
+        shell: pwsh
+        run: |
+          $baseline = (Get-Content vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          $root = Join-Path $env:RUNNER_TEMP 'vcpkg'
+          git clone --quiet https://github.com/microsoft/vcpkg $root
+          git -C $root checkout --quiet $baseline
+          & (Join-Path $root 'bootstrap-vcpkg.bat') -disableMetrics
+          "VCPKG_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Cache vcpkg
         uses: actions/cache@v4
         with:
@@ -44,7 +56,7 @@ jobs:
         shell: pwsh
         run: >
           cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
           -DVCPKG_TARGET_TRIPLET=${{ env.VCPKG_TRIPLET }}
           -DEXRVIEW_BUILD_SHELLEXT=ON
 

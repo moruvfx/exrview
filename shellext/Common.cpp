@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <cstdint>
 #include <mutex>
 
 HINSTANCE g_hInst = nullptr;
@@ -75,44 +76,103 @@ static std::shared_ptr<exrv::ColorPipeline> getPipeline(const std::string& confi
     return pipe;
 }
 
-static bool readAll(IStream* s, std::vector<char>& data, std::wstring& name)
-{
-    STATSTG st = {};
-    if (SUCCEEDED(s->Stat(&st, STATFLAG_DEFAULT))) {
-        if (st.pwcsName) {
-            name = st.pwcsName;
-            CoTaskMemFree(st.pwcsName);
+// Bọc IStream của Windows thành exrv::InputStream: OpenEXR chỉ đọc những chunk cần
+// (header, bảng offset, part/level được chọn) thay vì chép cả file vào RAM.
+// Chỉ được gọi từ thread đã nhận IStream -> file mở bằng openStream(..., threads = 0).
+class ComInputStream final : public exrv::InputStream {
+public:
+    ComInputStream(IStream* s, uint64_t size) : m_s(s), m_size(size) { m_s->AddRef(); }
+    ~ComInputStream() override { m_s->Release(); }
+    bool read(char* dst, uint64_t n) override
+    {
+        if (m_pos + n > m_size) return false;
+        if (!syncPos()) return false;
+        while (n > 0) {
+            ULONG want = (ULONG)std::min<uint64_t>(n, 1u << 30), got = 0;
+            HRESULT hr = m_s->Read(dst, want, &got);
+            m_pos += got;
+            m_streamPos = m_pos;
+            if (FAILED(hr) || got == 0) return false;
+            dst += got;
+            n -= got;
         }
+        return true;
     }
-    const ULONGLONG kMax = 4ull << 30; // 4 GB
-    ULONGLONG size = st.cbSize.QuadPart;
-    if (size > kMax) return false;
+    bool seek(uint64_t pos) override
+    {
+        m_pos = pos; // seek thật sự để lúc đọc (tránh gọi Seek thừa)
+        return true;
+    }
+    uint64_t tell() const override { return m_pos; }
+    uint64_t size() const override { return m_size; }
+
+private:
+    bool syncPos()
+    {
+        if (m_streamPos == m_pos) return true;
+        LARGE_INTEGER li;
+        li.QuadPart = (LONGLONG)m_pos;
+        if (FAILED(m_s->Seek(li, STREAM_SEEK_SET, nullptr))) return false;
+        m_streamPos = m_pos;
+        return true;
+    }
+    IStream* m_s;
+    uint64_t m_size;
+    uint64_t m_pos = 0;
+    uint64_t m_streamPos = UINT64_MAX;
+};
+
+// File nhỏ: chép vào RAM rồi giải nén đa luồng (nhanh nhất). File lớn: đọc trực tiếp từ stream.
+static const ULONGLONG kMemoryReadLimit = 64ull << 20; // 64 MB
+
+static bool readAll(IStream* s, ULONGLONG size, std::vector<char>& data)
+{
     LARGE_INTEGER zero = {};
-    s->Seek(zero, STREAM_SEEK_SET, nullptr);
+    if (FAILED(s->Seek(zero, STREAM_SEEK_SET, nullptr))) return false;
     data.clear();
-    if (size) data.reserve((size_t)size);
+    data.reserve((size_t)size);
     char buf[1 << 16];
     for (;;) {
         ULONG got = 0;
         HRESULT hr = s->Read(buf, sizeof(buf), &got);
         if (got) data.insert(data.end(), buf, buf + got);
-        if (FAILED(hr) || got == 0 || data.size() > kMax) break;
+        if (FAILED(hr) || got == 0 || data.size() > kMemoryReadLimit) break;
     }
-    return !data.empty();
+    return !data.empty() && data.size() <= kMemoryReadLimit;
 }
 
 bool renderExrStream(IStream* stream, int maxSize, RenderResult& out)
 {
     out = RenderResult();
-    std::vector<char> data;
+    if (!stream) {
+        out.error = L"Không đọc được dữ liệu file";
+        return false;
+    }
     std::wstring name;
-    if (!stream || !readAll(stream, data, name)) {
+    STATSTG st = {};
+    if (SUCCEEDED(stream->Stat(&st, STATFLAG_DEFAULT)) && st.pwcsName) {
+        name = st.pwcsName;
+        CoTaskMemFree(st.pwcsName);
+    }
+    ULONGLONG size = st.cbSize.QuadPart;
+    if (size == 0) {
+        // Stream không báo kích thước -> hỏi bằng Seek(END).
+        LARGE_INTEGER zero = {};
+        ULARGE_INTEGER end = {};
+        if (SUCCEEDED(stream->Seek(zero, STREAM_SEEK_END, &end))) size = end.QuadPart;
+    }
+    if (size == 0) {
         out.error = L"Không đọc được dữ liệu file";
         return false;
     }
     try {
         std::string err;
-        auto file = exrv::ExrFile::openMemory(std::move(data), &err);
+        std::unique_ptr<exrv::ExrFile> file;
+        std::vector<char> data;
+        if (size <= kMemoryReadLimit && readAll(stream, size, data))
+            file = exrv::ExrFile::openMemory(std::move(data), &err);
+        else
+            file = exrv::ExrFile::openStream(std::make_unique<ComInputStream>(stream, size), &err, 0);
         if (!file) {
             out.error = L"Không mở được EXR: " + toWide(err);
             return false;

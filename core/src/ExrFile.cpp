@@ -22,9 +22,11 @@
 #include <ImfStringAttribute.h>
 #include <ImfStringVectorAttribute.h>
 #include <ImfThreading.h>
+#include <ImfTiledInputPart.h>
 #include <ImfTileDescriptionAttribute.h>
 #include <ImfVecAttribute.h>
 #include <Iex.h>
+#include <half.h> // imath_half_to_float (Imath ≥ 3.1)
 
 #include <algorithm>
 #include <cctype>
@@ -34,6 +36,7 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <type_traits>
 
 namespace exrv {
 
@@ -277,43 +280,144 @@ int mapChannels(const Layer& layer, const Imf::ChannelList& list, std::string ou
     return n;
 }
 
-void downsample(Image& img, int maxSize)
+
+// Imf::IStream bọc InputStream (đọc thẳng từ IStream của Windows, không chép cả file).
+class StreamAdapter : public Imf::IStream {
+public:
+    explicit StreamAdapter(InputStream* s) : Imf::IStream("stream"), m_s(s) {}
+    bool read(char c[], int n) override
+    {
+        if (n < 0 || !m_s->read(c, (uint64_t)n)) throw IEX_NAMESPACE::InputExc("Unexpected end of file.");
+        return m_s->tell() < m_s->size();
+    }
+    uint64_t tellg() override { return m_s->tell(); }
+    void seekg(uint64_t pos) override
+    {
+        if (!m_s->seek(pos)) throw IEX_NAMESPACE::InputExc("Seek failed.");
+    }
+    void clear() override {}
+
+private:
+    InputStream* m_s;
+};
+
+// Kiểu pixel của bộ đệm đọc: float 32-bit hoặc half 16-bit (lưu dạng bit).
+struct F32 {
+    using T = float;
+    static float get(float v) { return v; }
+    static float one() { return 1.f; }
+    static Imf::PixelType type() { return Imf::FLOAT; }
+};
+struct F16 {
+    using T = uint16_t;
+    static float get(uint16_t v) { return imath_half_to_float(v); }
+    static uint16_t one() { return 0x3C00; } // 1.0
+    static Imf::PixelType type() { return Imf::HALF; }
+};
+
+// Chuẩn hoá: 1 channel -> xám, thiếu alpha -> 1.
+template <class Tr>
+void normalize(typename Tr::T* p, size_t n, int nColor, const std::string ch[4], bool hasAlpha)
 {
-    if (maxSize <= 0 || (img.width <= maxSize && img.height <= maxSize)) return;
-    double s = (double)maxSize / std::max(img.width, img.height);
-    int nw = std::max(1, (int)std::lround(img.width * s));
-    int nh = std::max(1, (int)std::lround(img.height * s));
-    std::vector<float> out((size_t)nw * nh * 4);
-    std::vector<int> x0(nw + 1);
-    for (int x = 0; x <= nw; ++x) x0[x] = (int)((long long)x * img.width / nw);
-    for (int y = 0; y < nh; ++y) {
-        int ya = (int)((long long)y * img.height / nh), yb = std::max(ya + 1, (int)((long long)(y + 1) * img.height / nh));
-        for (int x = 0; x < nw; ++x) {
-            int xa = x0[x], xb = std::max(xa + 1, x0[x + 1]);
-            double acc[4] = {0, 0, 0, 0};
-            for (int sy = ya; sy < yb; ++sy) {
-                const float* p = &img.rgba[((size_t)sy * img.width + xa) * 4];
-                for (int sx = xa; sx < xb; ++sx, p += 4) {
-                    for (int c = 0; c < 4; ++c) acc[c] += std::isfinite(p[c]) ? p[c] : 0.0;
-                }
+    if (nColor != 1 && hasAlpha) return;
+    const int src = !ch[0].empty() ? 0 : (!ch[1].empty() ? 1 : 2);
+    for (size_t i = 0; i < n; ++i, p += 4) {
+        if (nColor == 1) p[0] = p[1] = p[2] = p[src];
+        if (!hasAlpha) p[3] = Tr::one();
+    }
+}
+
+// Box filter cộng dồn theo từng dòng nguồn: thu nhỏ ảnh lớn mà không cần giữ cả ảnh gốc trong RAM.
+class BoxAccum {
+public:
+    BoxAccum(int sw, int sh, int tw, int th)
+        : m_sw(sw), m_sh(sh), m_tw(tw), m_th(th), m_xmap(sw), m_col(tw, 0.f), m_row(th, 0.f), m_sum((size_t)tw * th * 4, 0.f)
+    {
+        for (int x = 0; x < sw; ++x) {
+            m_xmap[x] = (int)((long long)x * tw / sw);
+            m_col[m_xmap[x]] += 1.f;
+        }
+        for (int y = 0; y < sh; ++y) m_row[(size_t)((long long)y * th / sh)] += 1.f;
+    }
+    template <class Tr>
+    void addRow(int sy, const typename Tr::T* row)
+    {
+        float* o = &m_sum[(size_t)((long long)sy * m_th / m_sh) * m_tw * 4];
+        for (int sx = 0; sx < m_sw; ++sx, row += 4) {
+            float* q = o + (size_t)m_xmap[sx] * 4;
+            for (int c = 0; c < 4; ++c) {
+                float v = Tr::get(row[c]);
+                if (std::isfinite(v)) q[c] += v;
             }
-            double inv = 1.0 / ((double)(yb - ya) * (xb - xa));
-            float* o = &out[((size_t)y * nw + x) * 4];
-            for (int c = 0; c < 4; ++c) o[c] = (float)(acc[c] * inv);
         }
     }
-    img.width = nw;
-    img.height = nh;
-    img.rgba.swap(out);
+    void finish(std::vector<float>& out)
+    {
+        out.swap(m_sum);
+        for (int y = 0; y < m_th; ++y)
+            for (int x = 0; x < m_tw; ++x) {
+                float cnt = m_row[y] * m_col[x];
+                float inv = cnt > 0.f ? 1.f / cnt : 0.f;
+                float* p = &out[((size_t)y * m_tw + x) * 4];
+                for (int c = 0; c < 4; ++c) p[c] *= inv;
+            }
+    }
+
+private:
+    int m_sw, m_sh, m_tw, m_th;
+    std::vector<int> m_xmap;
+    std::vector<float> m_col, m_row, m_sum;
+};
+
+// Đặt ảnh sw x sh vào ảnh đích ow x oh tại (ox, oy), phần ngoài = 0. Trùng khít thì chỉ chuyển bộ đệm.
+template <class T>
+void place(std::vector<T>& src, int sw, int sh, std::vector<T>& dst, int ow, int oh, int ox, int oy)
+{
+    if (ox == 0 && oy == 0 && sw == ow && sh == oh) {
+        dst.swap(src);
+        return;
+    }
+    dst.assign((size_t)ow * oh * 4, T(0));
+    int x0 = std::max(0, -ox), x1 = std::min(sw, ow - ox); // [x0, x1) theo toạ độ nguồn
+    if (x0 >= x1) return;
+    for (int sy = 0; sy < sh; ++sy) {
+        int ty = oy + sy;
+        if (ty < 0 || ty >= oh) continue;
+        std::memcpy(&dst[((size_t)ty * ow + (ox + x0)) * 4], &src[((size_t)sy * sw + x0) * 4],
+                    sizeof(T) * 4 * (size_t)(x1 - x0));
+    }
 }
 
 } // namespace
 
+// ---------------------------------------------------------------- Image
+float halfToFloat(uint16_t h) { return imath_half_to_float(h); }
+
+void Image::pixel(int x, int y, float out[4]) const
+{
+    size_t i = ((size_t)y * width + x) * 4;
+    for (int c = 0; c < 4; ++c) out[c] = isHalf() ? imath_half_to_float(rgbaHalf[i + c]) : rgba[i + c];
+}
+
+void Image::toFloat(std::vector<float>& out) const
+{
+    if (!isHalf()) {
+        out = rgba;
+        return;
+    }
+    out.resize(rgbaHalf.size());
+    for (size_t i = 0; i < rgbaHalf.size(); ++i) out[i] = imath_half_to_float(rgbaHalf[i]);
+}
+
+// ---------------------------------------------------------------- ExrFile
 struct ExrFile::Impl {
     std::string path;
     std::vector<char> data;
     std::unique_ptr<MemIStream> stream;
-    std::unique_ptr<Imf::MultiPartInputFile> file;
+    std::unique_ptr<InputStream> src;
+    std::unique_ptr<StreamAdapter> adapter;
+    int threads = 0;
+    std::unique_ptr<Imf::MultiPartInputFile> file; // khai báo sau cùng: huỷ trước stream
     FileInfo info;
 };
 
@@ -356,7 +460,8 @@ std::unique_ptr<ExrFile> ExrFile::openPath(const std::string& utf8Path, std::str
     std::unique_ptr<ExrFile> f(new ExrFile);
     try {
         f->d->path = utf8Path;
-        f->d->file.reset(new Imf::MultiPartInputFile(utf8Path.c_str(), Imf::globalThreadCount()));
+        f->d->threads = Imf::globalThreadCount();
+        f->d->file.reset(new Imf::MultiPartInputFile(utf8Path.c_str(), f->d->threads));
         buildInfo(*f->d->file, f->d->info);
     } catch (const std::exception& e) {
         if (err) *err = e.what();
@@ -371,8 +476,30 @@ std::unique_ptr<ExrFile> ExrFile::openMemory(std::vector<char> data, std::string
     std::unique_ptr<ExrFile> f(new ExrFile);
     try {
         f->d->data = std::move(data);
+        f->d->threads = Imf::globalThreadCount();
         f->d->stream.reset(new MemIStream(f->d->data.data(), f->d->data.size()));
-        f->d->file.reset(new Imf::MultiPartInputFile(*f->d->stream, Imf::globalThreadCount()));
+        f->d->file.reset(new Imf::MultiPartInputFile(*f->d->stream, f->d->threads));
+        buildInfo(*f->d->file, f->d->info);
+    } catch (const std::exception& e) {
+        if (err) *err = e.what();
+        return nullptr;
+    }
+    return f;
+}
+
+std::unique_ptr<ExrFile> ExrFile::openStream(std::unique_ptr<InputStream> stream, std::string* err, int threads)
+{
+    if (!stream) {
+        if (err) *err = "Stream rỗng";
+        return nullptr;
+    }
+    initThreads();
+    std::unique_ptr<ExrFile> f(new ExrFile);
+    try {
+        f->d->src = std::move(stream);
+        f->d->threads = std::max(0, threads);
+        f->d->adapter.reset(new StreamAdapter(f->d->src.get()));
+        f->d->file.reset(new Imf::MultiPartInputFile(*f->d->adapter, f->d->threads));
         buildInfo(*f->d->file, f->d->info);
     } catch (const std::exception& e) {
         if (err) *err = e.what();
@@ -425,6 +552,13 @@ bool ExrFile::chromaticities(int part, float out[8]) const
 
 bool ExrFile::readLayer(int part, int layerIdx, Image& out, std::string* err, int maxSize) const
 {
+    ReadOptions opt;
+    opt.maxSize = maxSize;
+    return readLayer(part, layerIdx, out, err, opt);
+}
+
+bool ExrFile::readLayer(int part, int layerIdx, Image& out, std::string* err, const ReadOptions& opt) const
+{
     out = Image();
     if (part < 0 || part >= (int)d->info.parts.size()) { if (err) *err = "Part không hợp lệ"; return false; }
     const Part& P = d->info.parts[part];
@@ -436,81 +570,176 @@ bool ExrFile::readLayer(int part, int layerIdx, Image& out, std::string* err, in
     std::string ch[4];
     bool lumaChroma = false;
     int nColor = mapChannels(L, h.channels(), ch, lumaChroma);
+    // File luminance/chroma (Y, RY, BY): để RgbaInputFile tự chuyển sang RGB (luôn trả về half).
+    const bool useLuma = lumaChroma && d->info.parts.size() == 1;
+    if (useLuma) {
+        nColor = 3;
+        ch[3] = "A";
+    }
+    const bool hasAlpha = !ch[3].empty();
 
-    int dw = P.dataX1 - P.dataX0 + 1, dh = P.dataY1 - P.dataY0 + 1;
+    const int dw = P.dataX1 - P.dataX0 + 1, dh = P.dataY1 - P.dataY0 + 1;
     if (dw <= 0 || dh <= 0 || P.width <= 0 || P.height <= 0) { if (err) *err = "Data window rỗng"; return false; }
-    std::vector<float> buf;
-    std::string warn;
 
-    try {
-        if (lumaChroma && d->info.parts.size() == 1) {
-            // File luminance/chroma (Y, RY, BY): để RgbaInputFile tự chuyển sang RGB.
+    // Vùng ảnh đầu ra: display window, hoặc display ∪ data window khi bật overscan.
+    int wx0 = P.dispX, wy0 = P.dispY, wx1 = P.dispX + P.width - 1, wy1 = P.dispY + P.height - 1;
+    if (opt.overscan) {
+        wx0 = std::min(wx0, P.dataX0); wy0 = std::min(wy0, P.dataY0);
+        wx1 = std::max(wx1, P.dataX1); wy1 = std::max(wy1, P.dataY1);
+    }
+    const int ww = wx1 - wx0 + 1, wh = wy1 - wy0 + 1;
+    double s = 1.0;
+    if (opt.maxSize > 0 && std::max(ww, wh) > opt.maxSize) s = (double)opt.maxSize / std::max(ww, wh);
+    auto sc = [s](int v) { return (int)std::lround(v * s); };
+    const int ow = std::max(1, sc(ww)), oh = std::max(1, sc(wh));
+    const int tw = std::max(1, sc(dw)), th = std::max(1, sc(dh)); // data window sau khi thu nhỏ
+    const int ox = sc(P.dataX0 - wx0), oy = sc(P.dataY0 - wy0);
+    const bool resample = tw != dw || th != dh;
+
+    // Mọi channel cần đọc đều HALF -> giữ half (không mất dữ liệu, nửa RAM).
+    bool allHalf = true;
+    if (!useLuma)
+        for (int i = 0; i < 4; ++i) {
+            if (ch[i].empty()) continue;
+            const Imf::Channel* c = h.channels().findChannel(ch[i]);
+            if (!c || c->type != Imf::HALF) allHalf = false;
+        }
+
+    out.width = ow;
+    out.height = oh;
+    out.sourceChannels = nColor + (hasAlpha ? 1 : 0);
+    out.hasAlpha = hasAlpha;
+    out.dispX = sc(P.dispX - wx0);
+    out.dispY = sc(P.dispY - wy0);
+    out.dispW = std::max(1, sc(P.width));
+    out.dispH = std::max(1, sc(P.height));
+
+    std::string warn;
+    auto keepWarn = [&warn](const std::exception& e) { if (warn.empty()) warn = e.what(); };
+    auto addSlices = [&](Imf::FrameBuffer& fb, Imf::PixelType type, char* base, size_t px, int x0, int y0, int x1, int y1) {
+        Imath::Box2i box(Imath::V2i(x0, y0), Imath::V2i(x1, y1));
+        for (int i = 0; i < 4; ++i) {
+            if (ch[i].empty()) continue;
+            fb.insert(ch[i], Imf::Slice::Make(type, base + i * px, box, px * 4, px * 4 * (size_t)(x1 - x0 + 1)));
+        }
+    };
+
+    // Đọc nguyên data window (độ phân giải gốc) vào buf.
+    auto readFull = [&](auto tr, auto& buf) {
+        using Tr = decltype(tr);
+        using T = typename Tr::T;
+        buf.assign((size_t)dw * dh * 4, T(0));
+        if (useLuma) {
             std::unique_ptr<Imf::RgbaInputFile> rf;
             std::unique_ptr<MemIStream> ms;
-            if (!d->data.empty()) {
+            std::unique_ptr<StreamAdapter> sa;
+            if (d->src) {
+                sa.reset(new StreamAdapter(d->src.get()));
+                rf.reset(new Imf::RgbaInputFile(*sa, d->threads));
+            } else if (!d->data.empty()) {
                 ms.reset(new MemIStream(d->data.data(), d->data.size()));
-                rf.reset(new Imf::RgbaInputFile(*ms, Imf::globalThreadCount()));
+                rf.reset(new Imf::RgbaInputFile(*ms, d->threads));
             } else {
-                rf.reset(new Imf::RgbaInputFile(d->path.c_str(), Imf::globalThreadCount()));
+                rf.reset(new Imf::RgbaInputFile(d->path.c_str(), d->threads));
             }
             std::vector<Imf::Rgba> px((size_t)dw * dh);
             rf->setFrameBuffer(px.data() - P.dataX0 - (ptrdiff_t)P.dataY0 * dw, 1, dw);
-            try { rf->readPixels(P.dataY0, P.dataY1); } catch (const std::exception& e) { warn = e.what(); }
-            buf.resize((size_t)dw * dh * 4);
-            for (size_t i = 0; i < px.size(); ++i) {
-                buf[i * 4 + 0] = px[i].r; buf[i * 4 + 1] = px[i].g;
-                buf[i * 4 + 2] = px[i].b; buf[i * 4 + 3] = px[i].a;
-            }
-            nColor = 3;
-            ch[3] = "A";
+            try { rf->readPixels(P.dataY0, P.dataY1); } catch (const std::exception& e) { keepWarn(e); }
+            static_assert(sizeof(Imf::Rgba) == 4 * sizeof(uint16_t), "Rgba phải là 4 half");
+            std::vector<uint16_t> bits((size_t)dw * dh * 4);
+            std::memcpy(bits.data(), px.data(), bits.size() * sizeof(uint16_t));
+            if constexpr (std::is_same<T, uint16_t>::value) buf.swap(bits);
+            else for (size_t i = 0; i < bits.size(); ++i) buf[i] = imath_half_to_float(bits[i]);
         } else {
-            buf.assign((size_t)dw * dh * 4, 0.f);
             Imf::FrameBuffer fb;
-            Imath::Box2i box(Imath::V2i(P.dataX0, P.dataY0), Imath::V2i(P.dataX1, P.dataY1));
-            for (int i = 0; i < 4; ++i) {
-                if (ch[i].empty()) continue;
-                fb.insert(ch[i], Imf::Slice::Make(Imf::FLOAT, &buf[i], box, sizeof(float) * 4, sizeof(float) * 4 * dw));
-            }
+            addSlices(fb, Tr::type(), reinterpret_cast<char*>(buf.data()), sizeof(T), P.dataX0, P.dataY0, P.dataX1, P.dataY1);
             Imf::InputPart in(*d->file, part);
             in.setFrameBuffer(fb);
             // File render dở dang vẫn hiển thị được phần đã có.
-            try { in.readPixels(P.dataY0, P.dataY1); } catch (const std::exception& e) { warn = e.what(); }
+            try { in.readPixels(P.dataY0, P.dataY1); } catch (const std::exception& e) { keepWarn(e); }
+        }
+        normalize<Tr>(buf.data(), (size_t)dw * dh, nColor, ch, hasAlpha);
+    };
+
+    try {
+        if (!resample) {
+            if (allHalf && opt.allowHalf) {
+                std::vector<uint16_t> buf;
+                readFull(F16(), buf);
+                place(buf, dw, dh, out.rgbaHalf, ow, oh, ox, oy);
+            } else {
+                std::vector<float> buf;
+                readFull(F32(), buf);
+                place(buf, dw, dh, out.rgba, ow, oh, ox, oy);
+            }
+        } else {
+            std::vector<float> small;
+            bool done = false;
+
+            // Tiled có mipmap/ripmap: đọc level nhỏ nhất vẫn ≥ kích thước cần.
+            if (!useLuma && P.type == "tiledimage") {
+                Imf::TiledInputPart tp(*d->file, part);
+                int lx = 0, ly = 0;
+                if (tp.levelMode() == Imf::MIPMAP_LEVELS) {
+                    for (int l = tp.numLevels() - 1; l > 0; --l)
+                        if (tp.levelWidth(l) >= tw && tp.levelHeight(l) >= th) { lx = ly = l; break; }
+                } else if (tp.levelMode() == Imf::RIPMAP_LEVELS) {
+                    for (int l = tp.numXLevels() - 1; l > 0; --l)
+                        if (tp.levelWidth(l) >= tw) { lx = l; break; }
+                    for (int l = tp.numYLevels() - 1; l > 0; --l)
+                        if (tp.levelHeight(l) >= th) { ly = l; break; }
+                }
+                if (lx > 0 || ly > 0) {
+                    Imath::Box2i lb = tp.dataWindowForLevel(lx, ly);
+                    const int lw = lb.max.x - lb.min.x + 1, lh = lb.max.y - lb.min.y + 1;
+                    std::vector<float> buf((size_t)lw * lh * 4, 0.f);
+                    Imf::FrameBuffer fb;
+                    addSlices(fb, Imf::FLOAT, reinterpret_cast<char*>(buf.data()), sizeof(float), lb.min.x, lb.min.y,
+                              lb.max.x, lb.max.y);
+                    tp.setFrameBuffer(fb);
+                    try {
+                        tp.readTiles(0, tp.numXTiles(lx) - 1, 0, tp.numYTiles(ly) - 1, lx, ly);
+                    } catch (const std::exception& e) { keepWarn(e); }
+                    normalize<F32>(buf.data(), (size_t)lw * lh, nColor, ch, hasAlpha);
+                    BoxAccum acc(lw, lh, tw, th);
+                    for (int y = 0; y < lh; ++y) acc.addRow<F32>(y, &buf[(size_t)y * lw * 4]);
+                    acc.finish(small);
+                    done = true;
+                }
+            }
+
+            if (!done && useLuma) {
+                std::vector<float> buf;
+                readFull(F32(), buf);
+                BoxAccum acc(dw, dh, tw, th);
+                for (int y = 0; y < dh; ++y) acc.addRow<F32>(y, &buf[(size_t)y * dw * 4]);
+                acc.finish(small);
+            } else if (!done) {
+                // Đọc theo dải 256 dòng (≥ số dòng/chunk lớn nhất, DWAB) và cộng dồn ngay:
+                // RAM chỉ cần 1 dải thay vì cả ảnh gốc.
+                const int strip = 256;
+                std::vector<float> buf((size_t)dw * strip * 4);
+                BoxAccum acc(dw, dh, tw, th);
+                Imf::InputPart in(*d->file, part);
+                for (int y0 = P.dataY0; y0 <= P.dataY1; y0 += strip) {
+                    const int y1 = std::min(P.dataY1, y0 + strip - 1), rows = y1 - y0 + 1;
+                    std::fill(buf.begin(), buf.begin() + (size_t)dw * rows * 4, 0.f);
+                    Imf::FrameBuffer fb;
+                    addSlices(fb, Imf::FLOAT, reinterpret_cast<char*>(buf.data()), sizeof(float), P.dataX0, y0, P.dataX1, y1);
+                    in.setFrameBuffer(fb);
+                    try { in.readPixels(y0, y1); } catch (const std::exception& e) { keepWarn(e); }
+                    normalize<F32>(buf.data(), (size_t)dw * rows, nColor, ch, hasAlpha);
+                    for (int r = 0; r < rows; ++r) acc.addRow<F32>(y0 - P.dataY0 + r, &buf[(size_t)r * dw * 4]);
+                }
+                acc.finish(small);
+            }
+            place(small, tw, th, out.rgba, ow, oh, ox, oy);
         }
     } catch (const std::exception& e) {
         if (err) *err = e.what();
         return false;
     }
 
-    // Chuẩn hoá: 1 channel -> xám, thiếu alpha -> 1.
-    bool hasAlpha = !ch[3].empty();
-    size_t n = (size_t)dw * dh;
-    for (size_t i = 0; i < n; ++i) {
-        float* p = &buf[i * 4];
-        if (nColor == 1) {
-            float v = !ch[0].empty() ? p[0] : (!ch[1].empty() ? p[1] : p[2]);
-            p[0] = p[1] = p[2] = v;
-        }
-        if (!hasAlpha) p[3] = 1.f;
-    }
-
-    // Đặt data window vào display window.
-    out.width = P.width;
-    out.height = P.height;
-    out.sourceChannels = nColor + (hasAlpha ? 1 : 0);
-    out.hasAlpha = hasAlpha;
-    if (P.dataX0 == P.dispX && P.dataY0 == P.dispY && dw == P.width && dh == P.height) {
-        out.rgba.swap(buf);
-    } else {
-        out.rgba.assign((size_t)P.width * P.height * 4, 0.f);
-        int x0 = std::max(P.dataX0, P.dispX), x1 = std::min(P.dataX1, P.dispX + P.width - 1);
-        int y0 = std::max(P.dataY0, P.dispY), y1 = std::min(P.dataY1, P.dispY + P.height - 1);
-        for (int y = y0; y <= y1 && x0 <= x1; ++y) {
-            const float* src = &buf[(((size_t)(y - P.dataY0)) * dw + (x0 - P.dataX0)) * 4];
-            float* dst = &out.rgba[(((size_t)(y - P.dispY)) * P.width + (x0 - P.dispX)) * 4];
-            std::memcpy(dst, src, sizeof(float) * 4 * (size_t)(x1 - x0 + 1));
-        }
-    }
-    downsample(out, maxSize);
     if (!warn.empty() && err) *err = "Đọc chưa trọn file: " + warn;
     return true;
 }

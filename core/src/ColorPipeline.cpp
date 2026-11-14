@@ -270,10 +270,14 @@ bool ColorPipeline::render(const Image& in, const ViewSettings& vs, std::vector<
     const size_t npx = (size_t)in.width * in.height;
     bgra.resize(npx * 4);
 
+    // Bộ đệm làm việc float (ảnh có thể lưu dạng half); chế độ channel áp dụng trước khi qua OCIO.
+    std::vector<float> work;
+    in.toFloat(work);
+
     // Kênh Alpha: hiển thị thẳng dạng xám, không qua OCIO.
     if (vs.channel == ChannelMode::Alpha) {
         for (size_t i = 0; i < npx; ++i) {
-            float a = std::min(1.f, std::max(0.f, in.rgba[i * 4 + 3]));
+            float a = std::min(1.f, std::max(0.f, work[i * 4 + 3]));
             uint8_t v = (uint8_t)(a * 255.f + 0.5f);
             bgra[i * 4 + 0] = bgra[i * 4 + 1] = bgra[i * 4 + 2] = v;
             bgra[i * 4 + 3] = 255;
@@ -310,8 +314,6 @@ bool ColorPipeline::render(const Image& in, const ViewSettings& vs, std::vector<
     OCIO::ConstCPUProcessorRcPtr cpu = d->cpu;
     if (d->cpuExposure) d->cpuExposure->setValue((double)vs.exposure);
 
-    // Bộ đệm làm việc (áp dụng chế độ channel trước khi qua OCIO).
-    std::vector<float> work(in.rgba);
     if (vs.channel != ChannelMode::RGB) {
         for (size_t i = 0; i < npx; ++i) {
             float* p = &work[i * 4];

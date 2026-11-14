@@ -29,7 +29,7 @@ Trình xem ảnh **OpenEXR** cho Windows, quản lý màu bằng **OpenColorIO**
 | C R G B A L | Kênh RGB / R / G / B / Alpha / Luminance |
 | [ ] · 0 | Exposure −½ / +½ stop · reset exposure & gamma |
 | ← → · Space · Home/End | Frame trước/sau · play/pause · frame đầu/cuối |
-| I · F5 | Bảng thông tin file · đọc lại file |
+| I · F5 · O | Bảng thông tin file · đọc lại file · hiện vùng overscan (data window) |
 
 ## Cách có file cài đặt
 
@@ -48,6 +48,7 @@ C:\vcpkg\bootstrap-vcpkg.bat
 .\build.ps1 -QtDir C:\Qt\6.8.0\msvc2022_64 -Vcpkg C:\vcpkg
 ```
 Kết quả: `dist\` (bản chạy ngay) và `installer\Output\ExrView-Setup-1.0.0.exe`.
+Phiên bản OpenEXR/OCIO được khoá bằng `builtin-baseline` trong `vcpkg.json`. Nếu vcpkg báo không tìm thấy baseline, chạy `git -C C:/vcpkg pull` rồi build lại.
 
 ## Cài đặt & sử dụng
 1. Chạy `ExrView-Setup-x.y.z.exe` (cần quyền Admin để đăng ký preview cho Explorer).

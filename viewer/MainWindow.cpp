@@ -303,6 +303,16 @@ void MainWindow::buildMenus()
         m_gammaSpin->setValue(1);
     });
     view->addSeparator();
+    auto* overscan = view->addAction(tr("Hiện vùng overscan (data window ngoài display window)"));
+    overscan->setCheckable(true);
+    overscan->setShortcut(QKeySequence(Qt::Key_O));
+    m_loader.setOverscan(QSettings().value("overscan", false).toBool());
+    overscan->setChecked(m_loader.overscan());
+    connect(overscan, &QAction::toggled, this, [this](bool on) {
+        QSettings().setValue("overscan", on);
+        m_loader.setOverscan(on);
+        if (m_index >= 0) showIndex(m_index); // khoá cache đổi theo chế độ -> đọc lại frame hiện tại
+    });
     view->addAction(m_infoDock->toggleViewAction());
     m_infoDock->toggleViewAction()->setShortcut(QKeySequence(Qt::Key_I));
 
@@ -348,7 +358,7 @@ void MainWindow::buildMenus()
                "C R G B A L  kênh RGB / R / G / B / Alpha / Luminance\n"
                "[ ]  exposure ∓½ stop · 0  reset exposure/gamma\n"
                "← →  frame trước/sau · Space  play/pause · Home/End  frame đầu/cuối\n"
-               "I  bảng thông tin file · F5  đọc lại file"));
+               "I  bảng thông tin file · F5  đọc lại file · O  hiện vùng overscan"));
     });
     help->addAction(tr("Giới thiệu"), this, [this] {
         QMessageBox::about(this, "ExrView",
@@ -512,7 +522,7 @@ void MainWindow::detectSequence(const QString& path)
 
 QString MainWindow::keyForIndex(int i) const
 {
-    return (i >= 0 && i < m_frames.size()) ? FrameLoader::key(m_frames[i], m_layerRef) : QString();
+    return (i >= 0 && i < m_frames.size()) ? m_loader.key(m_frames[i], m_layerRef) : QString();
 }
 
 void MainWindow::showIndex(int i)
@@ -598,8 +608,8 @@ void MainWindow::setFrame(FramePtr f)
     render();
     const auto& P = f->info.parts[f->part];
     m_infoLabel->setText(QString("%1×%2 · %3 · %4")
-                             .arg(f->image->width)
-                             .arg(f->image->height)
+                             .arg(P.width)
+                             .arg(P.height)
                              .arg(QString::fromStdString(P.compression))
                              .arg(humanSize(f->fileSize)));
     if (!f->warning.isEmpty()) m_view->setMessage(f->warning);
@@ -705,7 +715,8 @@ void MainWindow::updateHover(int x, int y, bool inside)
     }
     const auto& im = *m_frame->image;
     if (x >= im.width || y >= im.height) return;
-    const float* p = &im.rgba[((size_t)y * im.width + x) * 4];
+    float p[4];
+    im.pixel(x, y, p);
     // Giá trị hiển thị: chạy đúng 1 pixel qua OCIO (CPU) với cùng cài đặt.
     exrv::Image one;
     one.width = one.height = 1;
@@ -715,8 +726,8 @@ void MainWindow::updateHover(int x, int y, bool inside)
     if (m_pipeline.render(one, currentViewSettings(), out, nullptr)) d = qRgb(out[2], out[1], out[0]);
     const auto& P = m_frame->info.parts[m_frame->part];
     m_pixelLabel->setText(QString("x %1  y %2   R %3  G %4  B %5  A %6   →  %7 %8 %9")
-                              .arg(x + P.dispX, 5)
-                              .arg(y + P.dispY, 5)
+                              .arg(x - im.dispX + P.dispX, 5)
+                              .arg(y - im.dispY + P.dispY, 5)
                               .arg(fmtFloat(p[0]), 10)
                               .arg(fmtFloat(p[1]), 10)
                               .arg(fmtFloat(p[2]), 10)

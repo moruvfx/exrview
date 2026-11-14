@@ -38,7 +38,10 @@ public:
     explicit FrameLoader(QObject* parent = nullptr);
     ~FrameLoader() override;
 
-    static QString key(const QString& path, const LayerRef& ref);
+    // Khoá cache gồm cả chế độ overscan (ảnh khác kích thước).
+    QString key(const QString& path, const LayerRef& ref) const;
+    void setOverscan(bool on) { m_overscan = on; }
+    bool overscan() const { return m_overscan; }
     FramePtr cached(const QString& key) const;
     bool isPending(const QString& key) const { return m_pending.contains(key); }
     int pendingCount() const { return m_pending.size(); }
@@ -48,7 +51,7 @@ public:
     int budgetMB() const { return (int)m_cache.maxCost(); }
     int usedMB() const { return (int)m_cache.totalCost(); }
 
-    static FramePtr load(const QString& path, const LayerRef& ref);
+    static FramePtr load(const QString& path, const LayerRef& ref, bool overscan);
 
 signals:
     void loaded(const QString& key, FramePtr frame);
@@ -59,4 +62,5 @@ private:
     QThreadPool m_pool;
     QCache<QString, FramePtr> m_cache;
     QSet<QString> m_pending;
+    bool m_overscan = false;
 };
