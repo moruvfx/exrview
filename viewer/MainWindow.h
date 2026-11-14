@@ -20,6 +20,9 @@ class QTreeWidget;
 class QDockWidget;
 class QMenu;
 class QWidget;
+class QSplitter;
+class QAction;
+struct Frame;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -38,6 +41,7 @@ private:
     void buildUi();
     void buildMenus();
     QWidget* buildSequenceBar();
+    QWidget* buildComparePanel();
 
     // OCIO
     void loadOcioConfig(const QString& path);
@@ -58,6 +62,22 @@ private:
     void render();
     void updateHover(int x, int y, bool inside);
     void updateTitle();
+    QString autoInputFor(const Frame& f, bool* dataLayer) const;
+    void fillLayerCombo(QComboBox* combo, QString& signature, const Frame& f);
+
+    // So sánh A | B: khung B có layer/pass và cài đặt màu riêng, zoom/pan đồng bộ với A
+    void setCompare(bool on);
+    void copyAtoB();
+    void showIndexB(int i);
+    void setFrameB(FramePtr f);
+    void populateColorCombosB();
+    void populateViewsB();
+    void syncPipelineB();
+    QString resolvedInputB() const;
+    exrv::ViewSettings viewSettingsB();
+    void renderB();
+    void applyCompareLayout();           // bố trí theo chế độ: cạnh nhau / wipe / difference
+    void setCompareViewMode(int mode);   // 0 cạnh nhau, 1 wipe, 2 difference (bật so sánh nếu đang tắt)
 
     // Sequence
     void togglePlay();
@@ -118,4 +138,27 @@ private:
     bool m_updatingUi = false;
     int m_hoverX = -1, m_hoverY = -1;
     bool m_hoverInside = false;
+
+    // So sánh A | B
+    exrv::ColorPipeline m_pipelineB; // riêng cho B: shader GPU/processor CPU của mỗi khung độc lập
+    QSplitter* m_splitter = nullptr;
+    QWidget* m_bPanel = nullptr;
+    ImageView* m_viewB = nullptr;
+    QWidget* m_bBar = nullptr;
+    QAction* m_compareAct = nullptr;
+    QComboBox* m_bModeCombo = nullptr;
+    QComboBox* m_bLayerCombo = nullptr;
+    QComboBox* m_bChannelCombo = nullptr;
+    QComboBox* m_bInputCombo = nullptr;
+    QComboBox* m_bDisplayCombo = nullptr;
+    QComboBox* m_bViewCombo = nullptr;
+    QDoubleSpinBox* m_bExpSpin = nullptr;
+    bool m_compare = false;
+    bool m_bInitialized = false;
+    LayerRef m_layerRefB;
+    FramePtr m_frameB;
+    QString m_wantedKeyB;
+    QString m_lastGuessB;
+    QString m_layerSignatureB;
+    bool m_syncingView = false;
 };

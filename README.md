@@ -12,6 +12,7 @@ Trình xem ảnh **OpenEXR** cho Windows, quản lý màu bằng **OpenColorIO**
 - **Exposure / Gamma** thay đổi tức thì — OCIO chạy trên **GPU** (OpenGL 3.3); máy không có GPU phù hợp tự chuyển sang CPU.
 - **Pixel inspector**: giá trị float gốc R G B A và giá trị hiển thị dưới con trỏ.
 - **Sequence**: mở 1 frame là tự nhận cả dãy `shot.1001.exr…`, play theo FPS, cache RAM có thể chỉnh (1–16 GB), prefetch frame kế tiếp.
+- **So sánh A | B** (phím **V**): chia đôi màn hình, mỗi khung chọn layer/pass, input color space, display/view, exposure riêng; zoom/pan và frame của sequence luôn đồng bộ, pixel inspector hiện giá trị cả hai khung. **Shift+V** đổi chia ngang/dọc, nút **B = A** chép cài đặt khung A sang B. Chế độ **Wipe** (phím **W**): A và B chồng trên một khung, kéo đường chia để so đúng cùng vùng ảnh. Chế độ **Hiệu** (phím **D**): hiện |A − B| trên giá trị gốc, exposure của A dùng làm hệ số khuếch đại, pixel NaN/Inf tô tím.
 - Bảng thông tin header (phím **I**), kéo-thả file, file gần đây.
 
 **Windows Explorer (ExrViewShell.dll)**
@@ -30,6 +31,8 @@ Trình xem ảnh **OpenEXR** cho Windows, quản lý màu bằng **OpenColorIO**
 | [ ] · 0 | Exposure −½ / +½ stop · reset exposure & gamma |
 | ← → · Space · Home/End | Frame trước/sau · play/pause · frame đầu/cuối |
 | I · F5 · O | Bảng thông tin file · đọc lại file · hiện vùng overscan (data window) |
+| V · Shift+V | So sánh 2 khung A/B · chia ngang/dọc |
+| W · D | So sánh kiểu Wipe (kéo đường chia) · Hiệu A − B |
 
 ## Cách có file cài đặt
 

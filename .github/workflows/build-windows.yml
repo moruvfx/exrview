@@ -94,6 +94,8 @@ jobs:
           tag_name: ${{ github.event.inputs.release_tag || github.ref_name }}
           target_commitish: ${{ github.sha }}
           name: ExrView ${{ github.event.inputs.release_tag || github.ref_name }}
+          # Tag có dấu '-' (vd v1.1.0-beta1) = bản thử nghiệm.
+          prerelease: ${{ contains(github.event.inputs.release_tag || github.ref_name, '-') }}
           body: |
             **Cài đặt:** tải `ExrView-Setup-*.exe`, chạy và đồng ý quyền Admin. Sau khi cài, mở thư mục có file .exr, chọn View → Large icons để thấy thumbnail, Alt+P để bật Preview pane.
 

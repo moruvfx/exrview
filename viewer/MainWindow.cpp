@@ -21,6 +21,7 @@
 #include <QMessageBox>
 #include <QSettings>
 #include <QSlider>
+#include <QSplitter>
 #include <QStatusBar>
 #include <QToolBar>
 #include <QToolButton>
@@ -84,7 +85,13 @@ void MainWindow::buildUi()
     auto* lay = new QVBoxLayout(central);
     lay->setContentsMargins(0, 0, 0, 0);
     lay->setSpacing(0);
-    lay->addWidget(m_view, 1);
+    m_splitter = new QSplitter(Qt::Horizontal);
+    m_splitter->setChildrenCollapsible(false);
+    m_splitter->addWidget(m_view);
+    m_bPanel = buildComparePanel();
+    m_splitter->addWidget(m_bPanel);
+    m_bPanel->hide();
+    lay->addWidget(m_splitter, 1);
     m_seqBar = buildSequenceBar();
     lay->addWidget(m_seqBar);
     m_seqBar->hide();
@@ -263,6 +270,113 @@ QWidget* MainWindow::buildSequenceBar()
     return bar;
 }
 
+// Khung B của chế độ so sánh: thanh chọn layer/pass + color space riêng, phía trên ImageView thứ hai.
+QWidget* MainWindow::buildComparePanel()
+{
+    auto* panel = new QWidget;
+    auto* v = new QVBoxLayout(panel);
+    v->setContentsMargins(0, 0, 0, 0);
+    v->setSpacing(0);
+
+    auto* bar = new QWidget;
+    m_bBar = bar;
+    auto* bv = new QVBoxLayout(bar);
+    bv->setContentsMargins(6, 3, 6, 3);
+    bv->setSpacing(2);
+    auto* row1 = new QHBoxLayout;
+    auto* row2 = new QHBoxLayout;
+    bv->addLayout(row1);
+    bv->addLayout(row2);
+    auto combo = [](int minChars) {
+        auto* c = new QComboBox;
+        c->setMaxVisibleItems(30);
+        c->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+        c->setMinimumContentsLength(minChars);
+        return c;
+    };
+
+    m_bModeCombo = new QComboBox;
+    m_bModeCombo->addItem(tr("Cạnh nhau"));
+    m_bModeCombo->addItem(tr("Wipe"));
+    m_bModeCombo->addItem(tr("Hiệu |A − B|"));
+    m_bModeCombo->setToolTip(tr("Cạnh nhau: 2 khung riêng · Wipe: kéo đường chia trên 1 khung (W) · "
+                                "Hiệu: |A − B| × 2^exposure của A, tím = NaN/Inf (D)"));
+    row1->addWidget(m_bModeCombo);
+    row1->addWidget(new QLabel(tr(" <b>B</b>  Layer")));
+    m_bLayerCombo = combo(18);
+    row1->addWidget(m_bLayerCombo, 1);
+    row1->addWidget(new QLabel(tr(" Kênh")));
+    m_bChannelCombo = new QComboBox;
+    for (auto* n : kChannelNames) m_bChannelCombo->addItem(n);
+    row1->addWidget(m_bChannelCombo);
+    auto* copyBtn = new QToolButton;
+    copyBtn->setText(tr("B = A"));
+    copyBtn->setToolTip(tr("Chép layer và cài đặt màu của khung A sang khung B"));
+    row1->addWidget(copyBtn);
+
+    row2->addWidget(new QLabel(tr("Input")));
+    m_bInputCombo = combo(14);
+    row2->addWidget(m_bInputCombo, 2);
+    row2->addWidget(new QLabel(tr(" Display")));
+    m_bDisplayCombo = combo(8);
+    row2->addWidget(m_bDisplayCombo, 1);
+    row2->addWidget(new QLabel(tr(" View")));
+    m_bViewCombo = combo(10);
+    row2->addWidget(m_bViewCombo, 1);
+    row2->addWidget(new QLabel(tr(" Exp")));
+    m_bExpSpin = new QDoubleSpinBox;
+    m_bExpSpin->setRange(-20, 20);
+    m_bExpSpin->setSingleStep(0.1);
+    m_bExpSpin->setDecimals(2);
+    m_bExpSpin->setSuffix(" EV");
+    row2->addWidget(m_bExpSpin);
+    v->addWidget(bar);
+
+    m_viewB = new ImageView(&m_pipelineB, panel);
+    m_viewB->setLabel("B");
+    m_view->setSecondPipeline(&m_pipelineB); // lớp B trong chế độ Wipe/Difference
+    v->addWidget(m_viewB, 1);
+
+    connect(m_bLayerCombo, QOverload<int>::of(&QComboBox::activated), this, [this](int idx) {
+        if (!m_frameB || idx < 0) return;
+        QPoint pl = m_bLayerCombo->itemData(idx).toPoint();
+        const auto& parts = m_frameB->info.parts;
+        if (pl.x() < 0 || pl.x() >= (int)parts.size()) return;
+        m_layerRefB.part = pl.x();
+        m_layerRefB.partName = QString::fromStdString(parts[pl.x()].name);
+        m_layerRefB.layerName = QString::fromStdString(parts[pl.x()].layers[pl.y()].name);
+        showIndexB(m_index);
+    });
+    connect(m_bChannelCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this] { renderB(); });
+    connect(m_bInputCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this] {
+        if (!m_updatingUi) renderB();
+    });
+    connect(m_bDisplayCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this] {
+        if (m_updatingUi) return;
+        populateViewsB();
+        renderB();
+    });
+    connect(m_bViewCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this] {
+        if (!m_updatingUi) renderB();
+    });
+    connect(m_bExpSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this] {
+        if (!m_updatingUi) renderB();
+    });
+    connect(copyBtn, &QToolButton::clicked, this, &MainWindow::copyAtoB);
+    connect(m_bModeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this] { applyCompareLayout(); });
+
+    connect(m_viewB, &ImageView::hovered, this, &MainWindow::updateHover);
+    connect(m_viewB, &ImageView::fileDropped, this, &MainWindow::openFile);
+    // Zoom/pan đồng bộ hai chiều: cùng vùng ảnh nằm cùng chỗ trên hai khung.
+    connect(m_view, &ImageView::viewChanged, this, [this](double z, QPointF o, bool fit) {
+        if (m_compare && !m_syncingView) m_viewB->setViewTransform(z, o, fit);
+    });
+    connect(m_viewB, &ImageView::viewChanged, this, [this](double z, QPointF o, bool fit) {
+        if (m_compare && !m_syncingView) m_view->setViewTransform(z, o, fit);
+    });
+    return panel;
+}
+
 void MainWindow::buildMenus()
 {
     auto* file = menuBar()->addMenu(tr("&File"));
@@ -313,6 +427,22 @@ void MainWindow::buildMenus()
         m_loader.setOverscan(on);
         if (m_index >= 0) showIndex(m_index); // khoá cache đổi theo chế độ -> đọc lại frame hiện tại
     });
+    view->addSeparator();
+    m_compareAct = view->addAction(tr("So sánh 2 khung A | B"));
+    m_compareAct->setCheckable(true);
+    m_compareAct->setShortcut(QKeySequence(Qt::Key_V));
+    m_compareAct->setToolTip(tr("Chia đôi màn hình: mỗi khung chọn layer/pass và color space riêng"));
+    connect(m_compareAct, &QAction::toggled, this, &MainWindow::setCompare);
+    view->addAction(tr("So sánh kiểu Wipe (kéo đường chia)"), QKeySequence(Qt::Key_W), this, [this] { setCompareViewMode(1); });
+    view->addAction(tr("So sánh kiểu Hiệu |A − B|"), QKeySequence(Qt::Key_D), this, [this] { setCompareViewMode(2); });
+    view->addAction(tr("Chia ngang / dọc"), QKeySequence(Qt::SHIFT | Qt::Key_V), this, [this] {
+        int o = QSettings().value("compareOrientation", (int)Qt::Horizontal).toInt();
+        QSettings().setValue("compareOrientation", o == Qt::Horizontal ? (int)Qt::Vertical : (int)Qt::Horizontal);
+        applyCompareLayout();
+    });
+    m_splitter->setOrientation((Qt::Orientation)QSettings().value("compareOrientation", (int)Qt::Horizontal).toInt());
+    view->addAction(tr("B = A (chép cài đặt khung A sang B)"), this, &MainWindow::copyAtoB);
+    view->addSeparator();
     view->addAction(m_infoDock->toggleViewAction());
     m_infoDock->toggleViewAction()->setShortcut(QKeySequence(Qt::Key_I));
 
@@ -358,7 +488,11 @@ void MainWindow::buildMenus()
                "C R G B A L  kênh RGB / R / G / B / Alpha / Luminance\n"
                "[ ]  exposure ∓½ stop · 0  reset exposure/gamma\n"
                "← →  frame trước/sau · Space  play/pause · Home/End  frame đầu/cuối\n"
-               "I  bảng thông tin file · F5  đọc lại file · O  hiện vùng overscan"));
+               "I  bảng thông tin file · F5  đọc lại file · O  hiện vùng overscan
+"
+               "V  so sánh 2 khung A | B (mỗi khung chọn pass/color space riêng) · Shift+V  chia ngang/dọc
+"
+               "W  wipe A/B (kéo đường chia, double-click về giữa) · D  hiệu |A − B| (exposure A = khuếch đại)"));
     });
     help->addAction(tr("Giới thiệu"), this, [this] {
         QMessageBox::about(this, "ExrView",
@@ -379,6 +513,7 @@ void MainWindow::loadOcioConfig(const QString& path)
     }
     QSettings().setValue("ocioConfig", path);
     m_view->colorConfigChanged();
+    syncPipelineB();
     populateColorCombos();
     render();
 }
@@ -413,6 +548,7 @@ void MainWindow::populateColorCombos()
     QString cfg = QString::fromStdString(m_pipeline.configName());
     m_configLabel->setText("OCIO: " + (cfg.size() > 48 ? cfg.left(45) + "…" : cfg));
     m_configLabel->setToolTip(QString::fromStdString(m_pipeline.configPath()));
+    populateColorCombosB();
 }
 
 void MainWindow::populateViews()
@@ -473,6 +609,9 @@ void MainWindow::openFile(const QString& path)
     addRecent(fi.absoluteFilePath());
     m_layerRef = LayerRef();
     m_layerSignature.clear();
+    m_layerRefB = LayerRef();
+    m_layerSignatureB.clear();
+    m_frameB.reset();
     m_frame.reset();
     detectSequence(fi.absoluteFilePath());
     showIndex(m_index);
@@ -545,25 +684,49 @@ void MainWindow::showIndex(int i)
         m_loader.request(m_frames[i], m_layerRef);
         if (!m_frame) m_view->setMessage(tr("Đang đọc %1…").arg(QFileInfo(m_frames[i]).fileName()));
     }
+    if (m_compare) showIndexB(i);
     if (!m_playTimer.isActive()) prefetchAround(i, 3, 1);
+}
+
+void MainWindow::showIndexB(int i)
+{
+    if (!m_compare || i < 0 || i >= m_frames.size()) return;
+    QString k = m_loader.key(m_frames[i], m_layerRefB);
+    m_wantedKeyB = k;
+    if (FramePtr f = m_loader.cached(k)) {
+        setFrameB(f);
+    } else {
+        m_loader.request(m_frames[i], m_layerRefB);
+        if (!m_frameB) m_viewB->setMessage(tr("Đang đọc %1…").arg(QFileInfo(m_frames[i]).fileName()));
+    }
 }
 
 void MainWindow::prefetchAround(int i, int ahead, int behind)
 {
     if (m_frames.size() < 2) return;
-    for (int k = 1; k <= ahead; ++k) {
-        int j = (i + k) % m_frames.size();
+    auto req = [this](int j) {
         m_loader.request(m_frames[j], m_layerRef);
-    }
-    for (int k = 1; k <= behind; ++k) {
-        int j = i - k;
-        if (j >= 0) m_loader.request(m_frames[j], m_layerRef);
-    }
+        if (m_compare) m_loader.request(m_frames[j], m_layerRefB);
+    };
+    for (int k = 1; k <= ahead; ++k) req((i + k) % m_frames.size());
+    for (int k = 1; k <= behind; ++k)
+        if (i - k >= 0) req(i - k);
 }
 
 void MainWindow::onLoaded(const QString& key, FramePtr f)
 {
     m_cacheLabel->setText(tr("Cache %1 / %2 MB").arg(m_loader.usedMB()).arg(m_loader.budgetMB()));
+    // A và B có thể cùng chờ một khoá (cùng layer) -> xử lý cả hai, không return sớm.
+    if (m_compare && key == m_wantedKeyB) {
+        if (!f->error.isEmpty()) {
+            m_frameB.reset();
+            m_viewB->clearSource();
+            m_view->setSecondSource(nullptr);
+            m_viewB->setMessage(tr("Không đọc được %1\n\n%2").arg(QFileInfo(f->path).fileName(), f->error));
+        } else {
+            setFrameB(f);
+        }
+    }
     if (key != m_wantedKey) return;
     if (!f->error.isEmpty()) {
         m_frame.reset();
@@ -575,32 +738,40 @@ void MainWindow::onLoaded(const QString& key, FramePtr f)
     setFrame(f);
 }
 
+// Color space "Tự động" cho một frame: theo header/tên file; layer không phải màu
+// (depth, N, P, motion...) -> role "data" (Raw) để thấy đúng giá trị.
+QString MainWindow::autoInputFor(const Frame& f, bool* dataLayer) const
+{
+    QString guess = QString::fromStdString(
+        m_pipeline.guessInput(f.csAttr, f.hasChroma ? f.chroma : nullptr, QFileInfo(f.path).fileName().toStdString()));
+    bool data = true;
+    const auto& L = f.info.parts[f.part].layers[f.layer];
+    for (const auto& c : L.channels) {
+        QString b = QString::fromStdString(c).section('.', -1).toLower();
+        if (b == "r" || b == "g" || b == "b" || b == "red" || b == "green" || b == "blue" ||
+            (b == "y" && L.name == "RGBA"))
+            data = false;
+    }
+    QString dataCs = QString::fromStdString(m_pipeline.canonicalColorSpace("data"));
+    if (data && !dataCs.isEmpty()) guess = dataCs;
+    if (dataLayer) *dataLayer = data && !dataCs.isEmpty();
+    return guess;
+}
+
 void MainWindow::setFrame(FramePtr f)
 {
     bool newFile = !m_frame;
     bool sameSize = m_frame && m_frame->image && f->image && m_frame->image->width == f->image->width &&
                     m_frame->image->height == f->image->height;
     m_frame = f;
-    m_lastGuess = QString::fromStdString(
-        m_pipeline.guessInput(f->csAttr, f->hasChroma ? f->chroma : nullptr, QFileInfo(f->path).fileName().toStdString()));
-
-    // Layer không phải màu (depth, N, P, motion...) -> dùng role "data" (Raw) để thấy đúng giá trị.
-    bool dataLayer = true;
-    const auto& L = f->info.parts[f->part].layers[f->layer];
-    for (const auto& c : L.channels) {
-        QString b = QString::fromStdString(c).section('.', -1).toLower();
-        if (b == "r" || b == "g" || b == "b" || b == "red" || b == "green" || b == "blue" ||
-            (b == "y" && L.name == "RGBA"))
-            dataLayer = false;
-    }
-    QString dataCs = QString::fromStdString(m_pipeline.canonicalColorSpace("data"));
-    if (dataLayer && !dataCs.isEmpty()) m_lastGuess = dataCs;
+    bool dataLayer = false;
+    m_lastGuess = autoInputFor(*f, &dataLayer);
 
     // Nhãn mục "Tự động" cho biết đang dùng color space nào.
     QString autoName = !m_lastGuess.isEmpty() ? m_lastGuess
                                               : (!m_defaultInput.isEmpty() ? m_defaultInput
                                                                            : QString::fromStdString(m_pipeline.sceneLinear()));
-    m_inputCombo->setItemText(0, tr("Tự động → %1%2").arg(autoName, m_lastGuess.isEmpty() ? tr(" (mặc định)") : (dataLayer && m_lastGuess == dataCs ? tr(" (layer dữ liệu)") : "")));
+    m_inputCombo->setItemText(0, tr("Tự động → %1%2").arg(autoName, m_lastGuess.isEmpty() ? tr(" (mặc định)") : (dataLayer ? tr(" (layer dữ liệu)") : "")));
 
     populateLayers();
     if (!m_playTimer.isActive()) updateInfoDock();
@@ -616,18 +787,45 @@ void MainWindow::setFrame(FramePtr f)
     updateTitle();
 }
 
+void MainWindow::setFrameB(FramePtr f)
+{
+    bool newFile = !m_frameB;
+    bool sameSize = m_frameB && m_frameB->image && f->image && m_frameB->image->width == f->image->width &&
+                    m_frameB->image->height == f->image->height;
+    m_frameB = f;
+    bool dataLayer = false;
+    m_lastGuessB = autoInputFor(*f, &dataLayer);
+    QString autoName = !m_lastGuessB.isEmpty() ? m_lastGuessB
+                                               : (!m_defaultInput.isEmpty() ? m_defaultInput
+                                                                            : QString::fromStdString(m_pipelineB.sceneLinear()));
+    m_bInputCombo->setItemText(0, tr("Tự động → %1%2").arg(autoName, m_lastGuessB.isEmpty() ? tr(" (mặc định)") : (dataLayer ? tr(" (layer dữ liệu)") : "")));
+    fillLayerCombo(m_bLayerCombo, m_layerSignatureB, *f);
+    // Khung B mới hiện hoặc đổi kích thước: theo zoom/pan của A (không để B tự fit rồi kéo A theo).
+    m_syncingView = true;
+    m_viewB->setSource(f->image, !newFile && sameSize);
+    m_syncingView = false;
+    if (newFile || !sameSize) m_viewB->setViewTransform(m_view->zoom(), m_view->viewOffset(), m_view->fitMode());
+    if (m_view->compareMode() != ImageView::CompareMode::Off) m_view->setSecondSource(f->image);
+    renderB();
+    if (!f->warning.isEmpty()) m_viewB->setMessage(f->warning);
+}
+
 void MainWindow::populateLayers()
 {
-    if (!m_frame) return;
-    const auto& parts = m_frame->info.parts;
+    if (m_frame) fillLayerCombo(m_layerCombo, m_layerSignature, *m_frame);
+}
+
+void MainWindow::fillLayerCombo(QComboBox* combo, QString& signature, const Frame& f)
+{
+    const auto& parts = f.info.parts;
     QString sig;
     for (auto& p : parts) {
         sig += QString::fromStdString(p.name) + "|";
         for (auto& l : p.layers) sig += QString::fromStdString(l.name) + ",";
     }
-    if (sig != m_layerSignature) {
-        m_layerSignature = sig;
-        m_layerCombo->clear();
+    if (sig != signature) {
+        signature = sig;
+        combo->clear();
         bool multi = parts.size() > 1;
         for (int p = 0; p < (int)parts.size(); ++p) {
             if (!parts[p].supported) continue;
@@ -643,12 +841,188 @@ void MainWindow::populateLayers()
                     QString pn = parts[p].name.empty() ? QString("part %1").arg(p) : QString::fromStdString(parts[p].name);
                     text = pn + " / " + text;
                 }
-                m_layerCombo->addItem(text, QPoint(p, l));
+                combo->addItem(text, QPoint(p, l));
             }
         }
     }
-    int idx = m_layerCombo->findData(QPoint(m_frame->part, m_frame->layer));
-    if (idx >= 0) m_layerCombo->setCurrentIndex(idx);
+    int idx = combo->findData(QPoint(f.part, f.layer));
+    if (idx >= 0) combo->setCurrentIndex(idx);
+}
+
+// ---------------------------------------------------------------- So sánh A | B
+void MainWindow::setCompare(bool on)
+{
+    if (on == m_compare) return;
+    m_compare = on;
+    m_bPanel->setVisible(on);
+    applyCompareLayout();
+    if (!on) {
+        m_frameB.reset();
+        m_wantedKeyB.clear();
+        m_viewB->clearSource();
+        if (m_hoverInside) updateHover(m_hoverX, m_hoverY, true);
+        return;
+    }
+    if (!m_bInitialized) {
+        copyAtoB(); // lần đầu: B bắt đầu giống A, người dùng đổi pass/color space từ đó
+        m_bInitialized = true;
+    } else {
+        showIndexB(m_index);
+    }
+}
+
+void MainWindow::setCompareViewMode(int mode)
+{
+    // Bấm lại phím của chế độ đang dùng -> về cạnh nhau.
+    if (m_compare && m_bModeCombo->currentIndex() == mode) mode = 0;
+    m_bModeCombo->setCurrentIndex(mode); // -> applyCompareLayout()
+    if (!m_compare) m_compareAct->setChecked(true); // -> setCompare(true)
+}
+
+void MainWindow::applyCompareLayout()
+{
+    const int mode = m_compare ? m_bModeCombo->currentIndex() : 0;
+    const bool single = m_compare && mode != 0; // Wipe / Difference: A và B chồng trên một khung
+    m_view->setLabel(m_compare && !single ? "A" : QString());
+    m_view->setCompareMode(!m_compare || mode == 0 ? ImageView::CompareMode::Off
+                           : mode == 1             ? ImageView::CompareMode::Wipe
+                                                   : ImageView::CompareMode::Difference);
+    if (single) {
+        // Chỉ giữ thanh điều khiển của B (dải mỏng dưới khung A).
+        m_viewB->hide();
+        m_bPanel->setMaximumHeight(m_bBar->sizeHint().height());
+        m_splitter->setOrientation(Qt::Vertical);
+        m_view->setSecondSource(m_frameB ? m_frameB->image : nullptr);
+        m_view->setSecondViewSettings(viewSettingsB());
+    } else {
+        m_bPanel->setMaximumHeight(QWIDGETSIZE_MAX);
+        m_viewB->show();
+        m_splitter->setOrientation(
+            (Qt::Orientation)QSettings().value("compareOrientation", (int)Qt::Horizontal).toInt());
+        if (m_compare) {
+            // Hai khung bằng nhau; pipeline B vừa phục vụ lớp B của khung A -> dựng lại shader khung B.
+            int total = m_splitter->orientation() == Qt::Horizontal ? m_splitter->width() : m_splitter->height();
+            m_splitter->setSizes({total / 2, total - total / 2});
+            m_viewB->colorConfigChanged();
+            if (m_frameB) {
+                m_syncingView = true;
+                m_viewB->setSource(m_frameB->image, false);
+                m_syncingView = false;
+                m_viewB->setViewTransform(m_view->zoom(), m_view->viewOffset(), m_view->fitMode());
+            }
+        }
+    }
+    if (m_hoverInside) updateHover(m_hoverX, m_hoverY, true);
+}
+
+void MainWindow::copyAtoB()
+{
+    m_updatingUi = true;
+    m_bChannelCombo->setCurrentIndex(m_channelCombo->currentIndex());
+    int ii = m_bInputCombo->findData(m_inputCombo->currentData());
+    m_bInputCombo->setCurrentIndex(qMax(0, ii));
+    int di = m_bDisplayCombo->findText(m_displayCombo->currentText());
+    if (di >= 0) m_bDisplayCombo->setCurrentIndex(di);
+    m_updatingUi = false;
+    populateViewsB();
+    m_updatingUi = true;
+    int vi = m_bViewCombo->findText(m_viewCombo->currentText());
+    if (vi >= 0) m_bViewCombo->setCurrentIndex(vi);
+    m_bExpSpin->setValue(m_expSpin->value());
+    m_updatingUi = false;
+    m_layerRefB = m_layerRef;
+    if (m_frame && m_layerRefB.part < 0) {
+        // A đang ở layer mặc định -> ghi rõ để B giữ nguyên khi A đổi layer sau này.
+        m_layerRefB.part = m_frame->part;
+        m_layerRefB.partName = QString::fromStdString(m_frame->info.parts[m_frame->part].name);
+        m_layerRefB.layerName = QString::fromStdString(m_frame->info.parts[m_frame->part].layers[m_frame->layer].name);
+    }
+    if (m_compare) {
+        showIndexB(m_index);
+        renderB();
+    }
+}
+
+void MainWindow::syncPipelineB()
+{
+    // Cùng config với A (đường dẫn rỗng = config mặc định: $OCIO hoặc ACES dựng sẵn).
+    std::string err;
+    if (!m_pipelineB.loadConfig(m_pipeline.configPath(), &err)) m_pipelineB.loadConfig("", &err);
+    if (m_viewB) m_viewB->colorConfigChanged();
+    if (m_view) m_view->secondColorConfigChanged();
+}
+
+void MainWindow::populateColorCombosB()
+{
+    if (!m_bInputCombo) return;
+    m_updatingUi = true;
+    QString oldInput = m_bInputCombo->currentData().toString();
+    QString oldDisplay = m_bDisplayCombo->currentText();
+    if (m_bInputCombo->count() == 0) oldInput = m_inputCombo->currentData().toString();
+    if (oldDisplay.isEmpty()) oldDisplay = m_displayCombo->currentText();
+
+    m_bInputCombo->clear();
+    m_bInputCombo->addItem(tr("Tự động"), QString());
+    for (auto& cs : m_pipelineB.colorSpaces()) {
+        QString n = QString::fromStdString(cs);
+        m_bInputCombo->addItem(n, n);
+    }
+    int ii = oldInput.isEmpty() ? 0 : m_bInputCombo->findData(oldInput);
+    m_bInputCombo->setCurrentIndex(ii < 0 ? 0 : ii);
+
+    m_bDisplayCombo->clear();
+    for (auto& dsp : m_pipelineB.displays()) m_bDisplayCombo->addItem(QString::fromStdString(dsp));
+    int di = m_bDisplayCombo->findText(oldDisplay);
+    if (di < 0) di = m_bDisplayCombo->findText(QString::fromStdString(m_pipelineB.defaultDisplay()));
+    m_bDisplayCombo->setCurrentIndex(qMax(0, di));
+    m_updatingUi = false;
+    populateViewsB();
+    renderB();
+}
+
+void MainWindow::populateViewsB()
+{
+    bool prev = m_updatingUi;
+    m_updatingUi = true;
+    QString old = m_bViewCombo->currentText();
+    if (old.isEmpty()) old = m_viewCombo->currentText();
+    std::string dsp = m_bDisplayCombo->currentText().toStdString();
+    m_bViewCombo->clear();
+    for (auto& v : m_pipelineB.views(dsp)) m_bViewCombo->addItem(QString::fromStdString(v));
+    int vi = m_bViewCombo->findText(old);
+    if (vi < 0) vi = m_bViewCombo->findText(QString::fromStdString(m_pipelineB.defaultView(dsp)));
+    m_bViewCombo->setCurrentIndex(qMax(0, vi));
+    m_updatingUi = prev;
+}
+
+QString MainWindow::resolvedInputB() const
+{
+    QString chosen = m_bInputCombo->currentData().toString();
+    if (!chosen.isEmpty()) return chosen;
+    if (!m_lastGuessB.isEmpty()) return m_lastGuessB;
+    if (!m_defaultInput.isEmpty()) return m_defaultInput;
+    return QString::fromStdString(m_pipelineB.sceneLinear());
+}
+
+exrv::ViewSettings MainWindow::viewSettingsB()
+{
+    exrv::ViewSettings vs;
+    vs.input = resolvedInputB().toStdString();
+    vs.display = m_bDisplayCombo->currentText().toStdString();
+    vs.view = m_bViewCombo->currentText().toStdString();
+    vs.exposure = (float)m_bExpSpin->value();
+    vs.gamma = (float)m_gammaSpin->value(); // gamma dùng chung
+    vs.channel = (exrv::ChannelMode)m_bChannelCombo->currentIndex();
+    return vs;
+}
+
+void MainWindow::renderB()
+{
+    if (!m_compare || m_updatingUi) return;
+    const exrv::ViewSettings vs = viewSettingsB();
+    m_viewB->setViewSettings(vs);
+    m_view->setSecondViewSettings(vs); // lớp B của Wipe
+    if (m_hoverInside) updateHover(m_hoverX, m_hoverY, true);
 }
 
 void MainWindow::updateInfoDock()
@@ -696,6 +1070,11 @@ void MainWindow::render()
 {
     if (m_updatingUi) return;
     m_view->setViewSettings(currentViewSettings());
+    if (m_compare) {
+        const exrv::ViewSettings vsB = viewSettingsB(); // gamma dùng chung
+        m_viewB->setViewSettings(vsB);
+        m_view->setSecondViewSettings(vsB);
+    }
     if (m_hoverInside) updateHover(m_hoverX, m_hoverY, true);
     if (m_infoDock->isVisible() && !m_playTimer.isActive()) {
         // cập nhật dòng "Input color space" trong bảng thông tin
@@ -709,32 +1088,46 @@ void MainWindow::updateHover(int x, int y, bool inside)
     m_hoverX = x;
     m_hoverY = y;
     m_hoverInside = inside;
-    if (!inside || !m_frame || !m_frame->image) {
+    // Giá trị gốc + giá trị hiển thị (chạy đúng 1 pixel qua OCIO trên CPU với cùng cài đặt).
+    auto sample = [x, y](const FramePtr& f, exrv::ColorPipeline& pipe, const exrv::ViewSettings& vs,
+                         QString& coords) -> QString {
+        if (!f || !f->image) return QString();
+        const auto& im = *f->image;
+        if (x < 0 || y < 0 || x >= im.width || y >= im.height) return QString();
+        float p[4];
+        im.pixel(x, y, p);
+        exrv::Image one;
+        one.width = one.height = 1;
+        one.rgba.assign(p, p + 4);
+        std::vector<uint8_t> out;
+        QRgb d = 0;
+        if (pipe.render(one, vs, out, nullptr)) d = qRgb(out[2], out[1], out[0]);
+        const auto& P = f->info.parts[f->part];
+        if (coords.isEmpty())
+            coords = QString("x %1  y %2").arg(x - im.dispX + P.dispX, 5).arg(y - im.dispY + P.dispY, 5);
+        return QString("R %1  G %2  B %3  A %4  →  %5 %6 %7")
+            .arg(fmtFloat(p[0]), 10)
+            .arg(fmtFloat(p[1]), 10)
+            .arg(fmtFloat(p[2]), 10)
+            .arg(fmtFloat(p[3]), 8)
+            .arg(qRed(d), 3)
+            .arg(qGreen(d), 3)
+            .arg(qBlue(d), 3);
+    };
+    if (!inside) {
         m_pixelLabel->clear();
         return;
     }
-    const auto& im = *m_frame->image;
-    if (x >= im.width || y >= im.height) return;
-    float p[4];
-    im.pixel(x, y, p);
-    // Giá trị hiển thị: chạy đúng 1 pixel qua OCIO (CPU) với cùng cài đặt.
-    exrv::Image one;
-    one.width = one.height = 1;
-    one.rgba.assign(p, p + 4);
-    std::vector<uint8_t> out;
-    QRgb d = 0;
-    if (m_pipeline.render(one, currentViewSettings(), out, nullptr)) d = qRgb(out[2], out[1], out[0]);
-    const auto& P = m_frame->info.parts[m_frame->part];
-    m_pixelLabel->setText(QString("x %1  y %2   R %3  G %4  B %5  A %6   →  %7 %8 %9")
-                              .arg(x - im.dispX + P.dispX, 5)
-                              .arg(y - im.dispY + P.dispY, 5)
-                              .arg(fmtFloat(p[0]), 10)
-                              .arg(fmtFloat(p[1]), 10)
-                              .arg(fmtFloat(p[2]), 10)
-                              .arg(fmtFloat(p[3]), 8)
-                              .arg(qRed(d), 3)
-                              .arg(qGreen(d), 3)
-                              .arg(qBlue(d), 3));
+    QString coords;
+    QString a = sample(m_frame, m_pipeline, currentViewSettings(), coords);
+    if (!m_compare) {
+        if (!a.isEmpty()) m_pixelLabel->setText(coords + "   " + a);
+        else m_pixelLabel->clear();
+        return;
+    }
+    QString b = sample(m_frameB, m_pipelineB, viewSettingsB(), coords);
+    m_pixelLabel->setText(coords + "   A: " + (a.isEmpty() ? QStringLiteral("—") : a) + "    B: " +
+                          (b.isEmpty() ? QStringLiteral("—") : b));
 }
 
 void MainWindow::updateTitle()
@@ -770,6 +1163,7 @@ void MainWindow::tick()
     int next = (m_index + 1) % m_frames.size();
     prefetchAround(m_index, 8, 0);
     if (!m_loader.cached(keyForIndex(next))) return; // chờ frame đọc xong — không nhảy cóc
+    if (m_compare && !m_loader.cached(m_loader.key(m_frames[next], m_layerRefB))) return;
     showIndex(next);
     ++m_fpsFrames;
     if (m_fpsClock.elapsed() > 1000) {
@@ -872,6 +1266,7 @@ void MainWindow::loadSettings()
         statusBar()->showMessage(tr("Không nạp được OCIO config đã lưu: %1").arg(QString::fromStdString(err)), 8000);
         m_pipeline.loadConfig("", &err);
     }
+    syncPipelineB();
     populateColorCombos();
     m_updatingUi = true;
     m_expSpin->setValue(s.value("exposure", 0.0).toDouble());
