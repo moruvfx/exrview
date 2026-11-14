@@ -61,7 +61,9 @@ jobs:
           -DEXRVIEW_BUILD_SHELLEXT=ON
 
       - name: Build
-        run: cmake --build build --config Release --parallel
+        run: |
+          echo "::add-matcher::.github/msvc-matcher.json"
+          cmake --build build --config Release --parallel
 
       - name: Package
         shell: pwsh
