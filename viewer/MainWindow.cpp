@@ -91,12 +91,15 @@ void MainWindow::buildUi()
     auto* lay = new QVBoxLayout(central);
     lay->setContentsMargins(0, 0, 0, 0);
     lay->setSpacing(0);
+    m_bBar = buildComparePanel();
+    m_bBar->hide();
+    lay->addWidget(m_bBar);
+
     m_splitter = new QSplitter(Qt::Horizontal);
     m_splitter->setChildrenCollapsible(false);
     m_splitter->addWidget(m_view);
-    m_bPanel = buildComparePanel();
-    m_splitter->addWidget(m_bPanel);
-    m_bPanel->hide();
+    m_splitter->addWidget(m_viewB);
+    m_viewB->hide();
     lay->addWidget(m_splitter, 1);
     m_seqBar = buildSequenceBar();
     lay->addWidget(m_seqBar);
@@ -336,20 +339,11 @@ QWidget* MainWindow::buildSequenceBar()
 
 QWidget* MainWindow::buildComparePanel()
 {
-    auto* panel = new QWidget;
-    auto* v = new QVBoxLayout(panel);
-    v->setContentsMargins(0, 0, 0, 0);
-    v->setSpacing(0);
-
     auto* bar = new QWidget;
-    m_bBar = bar;
-    auto* bv = new QVBoxLayout(bar);
-    bv->setContentsMargins(6, 3, 6, 3);
-    bv->setSpacing(2);
-    auto* row1 = new QHBoxLayout;
-    auto* row2 = new QHBoxLayout;
-    bv->addLayout(row1);
-    bv->addLayout(row2);
+    bar->setStyleSheet("background: #28282b; border-bottom: 1px solid #1c1c1e;");
+    auto* row1 = new QHBoxLayout(bar);
+    row1->setContentsMargins(6, 3, 6, 3);
+    row1->setSpacing(6);
     auto combo = [](int minChars) {
         auto* c = new QComboBox;
         c->setMaxVisibleItems(30);
@@ -366,12 +360,29 @@ QWidget* MainWindow::buildComparePanel()
                                 "Hiệu: |A − B| × 2^exposure của A, tím = NaN/Inf (D)"));
     row1->addWidget(m_bModeCombo);
     row1->addWidget(new QLabel(tr(" <b>B</b>  Layer")));
-    m_bLayerCombo = combo(18);
-    row1->addWidget(m_bLayerCombo, 1);
-    row1->addWidget(new QLabel(tr(" Kênh")));
+    m_bLayerCombo = combo(14);
+    row1->addWidget(m_bLayerCombo, 2);
+    row1->addWidget(new QLabel(tr("Kênh")));
     m_bChannelCombo = new QComboBox;
     for (auto* n : kChannelNames) m_bChannelCombo->addItem(n);
     row1->addWidget(m_bChannelCombo);
+
+    row1->addWidget(new QLabel(tr("Input")));
+    m_bInputCombo = combo(14);
+    row1->addWidget(m_bInputCombo, 2);
+    row1->addWidget(new QLabel(tr("Display")));
+    m_bDisplayCombo = combo(8);
+    row1->addWidget(m_bDisplayCombo, 1);
+    row1->addWidget(new QLabel(tr("View")));
+    m_bViewCombo = combo(10);
+    row1->addWidget(m_bViewCombo, 1);
+    row1->addWidget(new QLabel(tr("Exp")));
+    m_bExpSpin = new QDoubleSpinBox;
+    m_bExpSpin->setRange(-20, 20);
+    m_bExpSpin->setSingleStep(0.1);
+    m_bExpSpin->setDecimals(2);
+    m_bExpSpin->setSuffix(" EV");
+    row1->addWidget(m_bExpSpin);
 
     auto* openBBtn = new QToolButton;
     openBBtn->setText(tr("Mở B…"));
@@ -383,28 +394,9 @@ QWidget* MainWindow::buildComparePanel()
     copyBtn->setToolTip(tr("Đưa B về cùng file/layer và cài đặt màu của A"));
     row1->addWidget(copyBtn);
 
-    row2->addWidget(new QLabel(tr("Input")));
-    m_bInputCombo = combo(14);
-    row2->addWidget(m_bInputCombo, 2);
-    row2->addWidget(new QLabel(tr(" Display")));
-    m_bDisplayCombo = combo(8);
-    row2->addWidget(m_bDisplayCombo, 1);
-    row2->addWidget(new QLabel(tr(" View")));
-    m_bViewCombo = combo(10);
-    row2->addWidget(m_bViewCombo, 1);
-    row2->addWidget(new QLabel(tr(" Exp")));
-    m_bExpSpin = new QDoubleSpinBox;
-    m_bExpSpin->setRange(-20, 20);
-    m_bExpSpin->setSingleStep(0.1);
-    m_bExpSpin->setDecimals(2);
-    m_bExpSpin->setSuffix(" EV");
-    row2->addWidget(m_bExpSpin);
-    v->addWidget(bar);
-
-    m_viewB = new ImageView(&m_pipelineB, panel);
+    m_viewB = new ImageView(&m_pipelineB, this);
     m_viewB->setLabel("B");
     m_view->setSecondPipeline(&m_pipelineB);
-    v->addWidget(m_viewB, 1);
 
     connect(m_bLayerCombo, QOverload<int>::of(&QComboBox::activated), this, [this](int idx) {
         if (!m_frameB || idx < 0) return;
@@ -448,7 +440,7 @@ QWidget* MainWindow::buildComparePanel()
     connect(m_viewB, &ImageView::viewChanged, this, [this](double z, QPointF o, bool fit) {
         if (m_compare && !m_syncingView) m_view->setViewTransform(z, o, fit);
     });
-    return panel;
+    return bar;
 }
 
 void MainWindow::buildMenus()
@@ -1120,7 +1112,7 @@ void MainWindow::setCompare(bool on)
     if (on == m_compare) return;
     m_compare = on;
     if (on) ensurePipelineB();
-    m_bPanel->setVisible(on);
+    m_bBar->setVisible(on);
     applyCompareLayout();
     if (!on) {
         m_frameB.reset();
@@ -1154,13 +1146,10 @@ void MainWindow::applyCompareLayout()
                                                    : ImageView::CompareMode::Difference);
     if (single) {
         m_viewB->hide();
-        m_bPanel->setMaximumHeight(m_bBar->sizeHint().height());
-        m_splitter->setOrientation(Qt::Vertical);
         m_view->setSecondSource(m_frameB ? m_frameB->image : nullptr);
         m_view->setSecondViewSettings(viewSettingsB());
     } else {
-        m_bPanel->setMaximumHeight(QWIDGETSIZE_MAX);
-        m_viewB->show();
+        m_viewB->setVisible(m_compare);
         m_splitter->setOrientation(
             (Qt::Orientation)QSettings().value("compareOrientation", (int)Qt::Horizontal).toInt());
         if (m_compare) {

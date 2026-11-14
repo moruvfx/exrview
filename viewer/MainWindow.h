@@ -176,7 +176,6 @@ private:
     bool m_bPipelineReady = false;
     mutable QHash<QString, QPair<QString, bool>> m_guessCache;
     QSplitter* m_splitter = nullptr;
-    QWidget* m_bPanel = nullptr;
     ImageView* m_viewB = nullptr;
     QWidget* m_bBar = nullptr;
     QAction* m_compareAct = nullptr;
