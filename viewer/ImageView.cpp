@@ -320,6 +320,7 @@ void ImageView::freeLayerGl(Layer& L, bool texToo)
     if (texToo && L.tex) {
         glDeleteTextures(1, &L.tex);
         L.tex = 0;
+        L.texW = L.texH = 0;
     }
 }
 
@@ -395,20 +396,48 @@ void ImageView::uploadImage(Layer& L)
     if (!L.tex) glGenTextures(1, &L.tex);
     glBindTexture(GL_TEXTURE_2D, L.tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    if (L.src->isHalf()) {
-        // File gốc là half -> RGBA16F không mất gì, nửa bộ nhớ GPU.
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, L.src->width, L.src->height, 0, GL_RGBA, GL_HALF_FLOAT,
-                     L.src->rgbaHalf.data());
+    // File gốc là half -> RGBA16F không mất gì, nửa bộ nhớ GPU. Còn lại RGBA32F: giữ nguyên
+    // giá trị lớn (depth, position) — RGBA16F sẽ tràn thành Inf > 65504.
+    const bool half = L.src->isHalf();
+    const GLenum type = half ? GL_HALF_FLOAT : GL_FLOAT;
+    const void* data = half ? (const void*)L.src->rgbaHalf.data() : (const void*)L.src->rgba.data();
+    if (L.texW == L.src->width && L.texH == L.src->height && L.texHalf == half) {
+        // Frame kế tiếp của sequence (cùng kích thước): ghi đè vào vùng nhớ GPU đã có, không cấp phát lại.
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, L.src->width, L.src->height, GL_RGBA, type, data);
     } else {
-        // RGBA32F: giữ nguyên giá trị lớn (depth, position) — RGBA16F sẽ tràn thành Inf > 65504.
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, L.src->width, L.src->height, 0, GL_RGBA, GL_FLOAT,
-                     L.src->rgba.data());
+        glTexImage2D(GL_TEXTURE_2D, 0, half ? GL_RGBA16F : GL_RGBA32F, L.src->width, L.src->height, 0, GL_RGBA, type,
+                     data);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        L.texW = L.src->width;
+        L.texH = L.src->height;
+        L.texHalf = half;
     }
-    glGenerateMipmap(GL_TEXTURE_2D);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    L.mipsValid = false; // mipmap chỉ tạo khi thật sự cần (bindFiltered)
     glBindTexture(GL_TEXTURE_2D, 0);
     L.texDirty = false;
+}
+
+// Đặt bộ lọc cho texture đang bind. Thu nhỏ: mipmap (lọc trong không gian tuyến tính, trước OCIO);
+// phóng to: giữ pixel sắc nét. Khi đang play sequence bỏ qua mipmap (tốn GPU mỗi frame) và dùng
+// lọc tuyến tính — dừng play là tạo lại ngay.
+void ImageView::bindFiltered(Layer& L)
+{
+    const bool minify = m_zoom < 1.0;
+    const bool mips = minify && !m_playback;
+    if (mips && !L.mipsValid) {
+        glGenerateMipmap(GL_TEXTURE_2D);
+        L.mipsValid = true;
+    }
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, mips ? GL_LINEAR_MIPMAP_LINEAR : (minify ? GL_LINEAR : GL_NEAREST));
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, minify ? GL_LINEAR : GL_NEAREST);
+}
+
+void ImageView::setPlayback(bool on)
+{
+    if (on == m_playback) return;
+    m_playback = on;
+    update();
 }
 
 void ImageView::paintGL()
@@ -487,9 +516,7 @@ void ImageView::drawLayerGpu(Layer& L)
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, L.tex);
-    // Thu nhỏ: mipmap (lọc trong không gian tuyến tính, trước OCIO). Phóng to: giữ pixel sắc nét.
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, m_zoom < 1.0 ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, m_zoom < 1.0 ? GL_LINEAR : GL_NEAREST);
+    bindFiltered(L);
     L.prog->setUniformValue("exrv_image", 0);
     for (size_t i = 0; i < L.luts.size(); ++i) {
         glActiveTexture(GL_TEXTURE1 + (GLenum)i);
@@ -546,15 +573,12 @@ void ImageView::drawDiffGpu()
     m_diffProg->setUniformValue("gain", (float)std::exp2(A.vs.exposure));
     m_diffProg->setUniformValue("channel", (int)A.vs.channel);
     m_diffProg->setUniformValue("invGamma", 1.0f / qMax(0.01f, A.vs.gamma));
-    const GLint minF = m_zoom < 1.0 ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST, magF = m_zoom < 1.0 ? GL_LINEAR : GL_NEAREST;
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, A.tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minF);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, magF);
+    bindFiltered(A);
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, B.tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minF);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, magF);
+    bindFiltered(B);
     m_diffProg->setUniformValue("imgA", 0);
     m_diffProg->setUniformValue("imgB", 1);
     glBindVertexArray(m_vao);

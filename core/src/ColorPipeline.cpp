@@ -51,10 +51,10 @@ struct ColorPipeline::Impl {
     }
 };
 
-ColorPipeline::ColorPipeline() : d(new Impl)
+ColorPipeline::ColorPipeline(bool loadDefault) : d(new Impl)
 {
     std::string err;
-    loadConfig("", &err);
+    if (loadDefault) loadConfig("", &err);
 }
 ColorPipeline::~ColorPipeline() = default;
 
@@ -326,6 +326,28 @@ bool ColorPipeline::render(const Image& in, const ViewSettings& vs, std::vector<
             }
             p[0] = p[1] = p[2] = v;
         }
+    }
+
+    // Ảnh rất nhỏ (pixel inspector gọi với 1 pixel mỗi lần rê chuột): tính thẳng,
+    // không dựng bảng gamma 4097 phần tử và không tạo thread.
+    if (npx <= 256) {
+        try {
+            OCIO::PackedImageDesc desc(work.data(), in.width, in.height, 4);
+            cpu->apply(desc);
+        } catch (const std::exception& e) {
+            if (err) *err = e.what();
+            return false;
+        }
+        const double g = 1.0 / std::max(0.01f, vs.gamma);
+        for (size_t i = 0; i < npx; ++i) {
+            for (int c = 0; c < 3; ++c) {
+                float v = work[i * 4 + c];
+                double t = v > 0.f ? (v >= 1.f ? 1.0 : (double)v) : 0.0; // NaN -> 0
+                bgra[i * 4 + 2 - c] = (uint8_t)std::lround(std::pow(t, g) * 255.0);
+            }
+            bgra[i * 4 + 3] = 255;
+        }
+        return true;
     }
 
     // Bảng tra gamma + lượng tử hoá 8-bit.

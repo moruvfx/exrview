@@ -261,7 +261,8 @@ QWidget* MainWindow::buildSequenceBar()
     m_fpsSpin->setValue(24);
     m_fpsSpin->setDecimals(3);
     connect(m_fpsSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double f) {
-        if (m_playTimer.isActive()) m_playTimer.setInterval(qRound(1000.0 / f));
+        Q_UNUSED(f);
+        if (m_playTimer.isActive()) m_playTimer.setInterval(playTickMs());
     });
     l->addWidget(m_fpsSpin);
     m_cacheLabel = new QLabel;
@@ -518,6 +519,7 @@ void MainWindow::loadOcioConfig(const QString& path)
 
 void MainWindow::populateColorCombos()
 {
+    m_guessCache.clear(); // config có thể đã đổi
     m_updatingUi = true;
     QString oldInput = m_inputCombo->currentData().toString();
     QString oldDisplay = m_displayCombo->currentText();
@@ -606,6 +608,7 @@ void MainWindow::openFile(const QString& path)
     QSettings().setValue("lastDir", fi.absolutePath());
     addRecent(fi.absoluteFilePath());
     m_layerRef = LayerRef();
+    m_guessCache.clear();
     m_layerSignature.clear();
     m_layerRefB = LayerRef();
     m_layerSignatureB.clear();
@@ -740,6 +743,18 @@ void MainWindow::onLoaded(const QString& key, FramePtr f)
 // (depth, N, P, motion...) -> role "data" (Raw) để thấy đúng giá trị.
 QString MainWindow::autoInputFor(const Frame& f, bool* dataLayer) const
 {
+    // Mọi frame của một sequence cho cùng kết quả -> nhớ lại, không hỏi OCIO mỗi frame khi play.
+    // (Cache xoá khi mở file khác hoặc đổi OCIO config.)
+    const QString key = QString::fromStdString(f.csAttr) + QChar(0x1f) +
+                        (f.hasChroma ? QString::fromLatin1(QByteArray((const char*)f.chroma, sizeof(f.chroma)).toHex())
+                                     : QString()) +
+                        QChar(0x1f) + QString::number(f.part) + QChar(0x1f) + QString::number(f.layer) + QChar(0x1f) +
+                        QString::fromStdString(f.info.parts[f.part].layers[f.layer].name);
+    auto hit = m_guessCache.constFind(key);
+    if (hit != m_guessCache.constEnd()) {
+        if (dataLayer) *dataLayer = hit->second;
+        return hit->first;
+    }
     QString guess = QString::fromStdString(
         m_pipeline.guessInput(f.csAttr, f.hasChroma ? f.chroma : nullptr, QFileInfo(f.path).fileName().toStdString()));
     bool data = true;
@@ -752,7 +767,9 @@ QString MainWindow::autoInputFor(const Frame& f, bool* dataLayer) const
     }
     QString dataCs = QString::fromStdString(m_pipeline.canonicalColorSpace("data"));
     if (data && !dataCs.isEmpty()) guess = dataCs;
-    if (dataLayer) *dataLayer = data && !dataCs.isEmpty();
+    const bool isData = data && !dataCs.isEmpty();
+    m_guessCache.insert(key, qMakePair(guess, isData));
+    if (dataLayer) *dataLayer = isData;
     return guess;
 }
 
@@ -852,6 +869,7 @@ void MainWindow::setCompare(bool on)
 {
     if (on == m_compare) return;
     m_compare = on;
+    if (on) ensurePipelineB();
     m_bPanel->setVisible(on);
     applyCompareLayout();
     if (!on) {
@@ -941,8 +959,18 @@ void MainWindow::copyAtoB()
     }
 }
 
+// Nạp config cho pipeline B lần đầu cần tới (bật so sánh) — không làm lúc khởi động.
+void MainWindow::ensurePipelineB()
+{
+    if (m_bPipelineReady) return;
+    m_bPipelineReady = true;
+    syncPipelineB();
+    populateColorCombosB();
+}
+
 void MainWindow::syncPipelineB()
 {
+    if (!m_bPipelineReady) return;
     // Cùng config với A (đường dẫn rỗng = config mặc định: $OCIO hoặc ACES dựng sẵn).
     std::string err;
     if (!m_pipelineB.loadConfig(m_pipeline.configPath(), &err)) m_pipelineB.loadConfig("", &err);
@@ -952,7 +980,7 @@ void MainWindow::syncPipelineB()
 
 void MainWindow::populateColorCombosB()
 {
-    if (!m_bInputCombo) return;
+    if (!m_bInputCombo || !m_bPipelineReady) return;
     m_updatingUi = true;
     QString oldInput = m_bInputCombo->currentData().toString();
     QString oldDisplay = m_bDisplayCombo->currentText();
@@ -1144,6 +1172,8 @@ void MainWindow::togglePlay()
     if (m_playTimer.isActive()) {
         m_playTimer.stop();
         m_playBtn->setText("▶");
+        m_view->setPlayback(false); // tạo lại mipmap cho frame đang dừng
+        m_viewB->setPlayback(false);
         updateInfoDock();
         m_frameLabel->setToolTip(QString());
         return;
@@ -1151,18 +1181,34 @@ void MainWindow::togglePlay()
     m_playBtn->setText("⏸");
     m_fpsClock.restart();
     m_fpsFrames = 0;
-    m_playTimer.start(qRound(1000.0 / m_fpsSpin->value()));
+    m_view->setPlayback(true);
+    m_viewB->setPlayback(true);
+    // Timer chạy dày hơn chu kỳ frame; tick() tự so đồng hồ để đổi frame đúng lúc
+    // (FPS trung bình chính xác, frame vừa đọc xong được hiện ngay thay vì chờ thêm một chu kỳ).
+    m_playClock.restart();
+    m_nextDueNs = 0;
+    m_playTimer.start(playTickMs());
     prefetchAround(m_index, 8, 0);
+}
+
+int MainWindow::playTickMs() const
+{
+    return qBound(1, (int)(1000.0 / m_fpsSpin->value() / 4.0), 10);
 }
 
 void MainWindow::tick()
 {
     if (m_frames.size() < 2) return;
+    const qint64 now = m_playClock.nsecsElapsed();
+    if (now < m_nextDueNs) return; // chưa tới giờ của frame kế
     int next = (m_index + 1) % m_frames.size();
     prefetchAround(m_index, 8, 0);
     if (!m_loader.cached(keyForIndex(next))) return; // chờ frame đọc xong — không nhảy cóc
     if (m_compare && !m_loader.cached(m_loader.key(m_frames[next], m_layerRefB))) return;
     showIndex(next);
+    const qint64 period = (qint64)(1e9 / m_fpsSpin->value());
+    m_nextDueNs += period;
+    if (m_nextDueNs + period < now) m_nextDueNs = now + period; // đã trễ nhiều (chờ đọc file): không chạy dồn frame
     ++m_fpsFrames;
     if (m_fpsClock.elapsed() > 1000) {
         m_actualFps = m_fpsFrames * 1000.0 / m_fpsClock.elapsed();

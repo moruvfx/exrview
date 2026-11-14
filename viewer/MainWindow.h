@@ -4,6 +4,8 @@
 #include "exrcore.h"
 
 #include <QElapsedTimer>
+#include <QHash>
+#include <QPair>
 #include <QMainWindow>
 #include <QStringList>
 #include <QTimer>
@@ -73,6 +75,7 @@ private:
     void populateColorCombosB();
     void populateViewsB();
     void syncPipelineB();
+    void ensurePipelineB();
     QString resolvedInputB() const;
     exrv::ViewSettings viewSettingsB();
     void renderB();
@@ -83,6 +86,7 @@ private:
     void togglePlay();
     void tick();
     void stepFrame(int d);
+    int playTickMs() const;
 
     // Khác
     void applyToExplorerPreview();
@@ -133,6 +137,8 @@ private:
 
     QTimer m_playTimer;
     QElapsedTimer m_fpsClock;
+    QElapsedTimer m_playClock; // đồng hồ đổi frame khi play
+    qint64 m_nextDueNs = 0;
     int m_fpsFrames = 0;
     double m_actualFps = 0;
     bool m_updatingUi = false;
@@ -140,7 +146,11 @@ private:
     bool m_hoverInside = false;
 
     // So sánh A | B
-    exrv::ColorPipeline m_pipelineB; // riêng cho B: shader GPU/processor CPU của mỗi khung độc lập
+    // Riêng cho B: shader GPU/processor CPU của mỗi khung độc lập. Chỉ nạp config khi bật so sánh
+    // lần đầu (không làm chậm khởi động).
+    exrv::ColorPipeline m_pipelineB{false};
+    bool m_bPipelineReady = false;
+    mutable QHash<QString, QPair<QString, bool>> m_guessCache; // color space "Tự động" theo header/layer của sequence đang mở
     QSplitter* m_splitter = nullptr;
     QWidget* m_bPanel = nullptr;
     ImageView* m_viewB = nullptr;

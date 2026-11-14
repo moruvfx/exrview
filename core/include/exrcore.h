@@ -147,7 +147,8 @@ struct GpuShader {
 
 class ColorPipeline {
 public:
-    ColorPipeline();
+    // loadDefault = false: chưa nạp config nào (nạp sau bằng loadConfig) — tránh parse config hai lần.
+    explicit ColorPipeline(bool loadDefault = true);
     ~ColorPipeline();
 
     // path rỗng => tự chọn: biến môi trường OCIO -> config ACES dựng sẵn (OCIO >= 2.2)

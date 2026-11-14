@@ -49,6 +49,7 @@ public:
     // Đặt zoom/pan từ khung khác (chế độ so sánh) — không phát lại viewChanged.
     void setViewTransform(double zoom, QPointF offset, bool fitMode);
     void setLabel(const QString& label); // nhãn góc khung, vd "A" / "B"
+    void setPlayback(bool on);            // đang play sequence: ưu tiên tốc độ (không tạo mipmap mỗi frame)
 
 signals:
     void hovered(int x, int y, bool inside); // toạ độ pixel ảnh
@@ -82,6 +83,9 @@ private:
         bool cpuDirty = true;
         QOpenGLShaderProgram* prog = nullptr;
         unsigned tex = 0;
+        int texW = 0, texH = 0;   // kích thước/kiểu texture đang cấp phát (để ghi đè thay vì cấp lại)
+        bool texHalf = false;
+        bool mipsValid = false;
         std::vector<LutTex> luts;
         QImage cpuImage;
         bool valid() const { return src && !src->empty(); }
@@ -94,6 +98,7 @@ private:
     bool rebuildShader(Layer& L, QString* err);
     bool buildDiffShader(QString* err);
     void uploadImage(Layer& L);
+    void bindFiltered(Layer& L);
     void freeLayerGl(Layer& L, bool texToo);
     void drawLayerGpu(Layer& L);
     void drawDiffGpu();
@@ -110,6 +115,7 @@ private:
     CompareMode m_mode = CompareMode::Off;
     double m_wipe = 0.5; // vị trí đường wipe theo tỉ lệ bề ngang khung
     bool m_draggingWipe = false;
+    bool m_playback = false;
 
     // GL
     bool m_glOk = false;
